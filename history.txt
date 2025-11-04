@@ -13,3 +13,7 @@ N POMO 로 변경 (POMO N번 동시에 학습 )
 2025-10-16 
 idea 1.  : 특정 Action이 어떻게 수렴하는 확인좀 해보자 
 idea 2.  : Reward Function을 완성후의 결과가 아닌 edge based reward로 변경 ( 기존 state 대비 상승금액 )
+
+
+2025-11-04 
+Max num node 500개로 제한 

@@ -1,4 +1,9 @@
 # config.yaml
+
+
+# 이 크기로 모델의 아키텍처가 고정됩니다.
+max_num_nodes: 500  # (예시: 500개)
+
 # 모델 파라미터
 model_params:
    embedding_dim: 256

@@ -24,3 +24,6 @@ or_tools_solver/result/
 #zip
 *.7z
 *.zip
+
+#상세 주석 추가버전 코드 무시 
+*_annotation.py

@@ -102,7 +102,7 @@ def expand_ic_instances(available_ics: List[PowerIC], loads: List[Load], battery
 
 
 class PocatGenerator:
-    def __init__(self, config_file_path: str):
+    def __init__(self, config_file_path: str, max_num_nodes: int):
         with open(config_file_path, "r", encoding='utf-8') as f:
             config_data = json.load(f)
 
@@ -140,6 +140,16 @@ class PocatGenerator:
         
         config_data['available_ics'] = pruned_ics_dicts # Pruning된 최종 목록 사용
         self.config = PocatConfig(**config_data)
+
+        # 💡 [수정] '최대' 노드 수와 '실제' 노드 수를 분리
+        self.max_num_nodes = max_num_nodes
+        self.num_nodes_actual = len(self.config.node_names) # 실제 문제의 노드 수
+        
+        if self.num_nodes_actual > self.max_num_nodes:
+            raise ValueError(
+                f"문제의 실제 노드 수({self.num_nodes_actual})가 "
+                f"설정된 최대 노드 수({self.max_num_nodes})보다 큽니다."
+            )
 
         self.num_nodes = len(self.config.node_names)
         self.num_loads = len(self.config.loads)
