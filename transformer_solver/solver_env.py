@@ -5,7 +5,7 @@ from tensordict import TensorDict
 from torchrl.envs import EnvBase
 from typing import Optional, Dict, Union
 
-from torchrl.data import Unbounded, UnboundedDiscrete, CompositeSpec
+from torchrl.data import Unbounded, UnboundedDiscrete, Composite
 
 from .definitions import (
     SCALAR_PROMPT_FEATURE_DIM, FEATURE_DIM, FEATURE_INDEX,
@@ -58,7 +58,7 @@ class PocatEnv(EnvBase):
         """환경의 observation, action, reward 스펙을 정의합니다."""
         max_nodes = self.generator.max_num_nodes
         
-        self.observation_spec = CompositeSpec({
+        self.observation_spec = Composite({
             "nodes": Unbounded(shape=(max_nodes, FEATURE_DIM)),
             "scalar_prompt_features": Unbounded(shape=(SCALAR_PROMPT_FEATURE_DIM,)),
             "matrix_prompt_features": Unbounded(shape=(max_nodes, max_nodes)),
@@ -203,7 +203,7 @@ class PocatEnv(EnvBase):
         num_nodes_actual = self.generator.num_nodes_actual
         node_types_actual = td_initial["nodes"][0, :num_nodes_actual, FEATURE_INDEX["node_type"][0]:FEATURE_INDEX["node_type"][1]].argmax(-1)
         is_load_actual = (node_types_actual == NODE_TYPE_LOAD)
-
+        reset_td["unconnected_loads_mask"][:, :num_nodes_actual] = is_load_actual
         reset_td["unconnected_loads_mask"][:, num_nodes_actual:] = False
         reset_td.set("done", torch.zeros(batch_size, 1, dtype=torch.bool, device=self.device))
         return reset_td
