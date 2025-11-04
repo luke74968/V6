@@ -123,11 +123,11 @@ class PocatEnv(EnvBase):
                 self.power_sequences.append((j_idx, k_idx, f_flag))
 
     def select_start_nodes(self, td: TensorDict):
-        padding_mask = td["padding_mask"][0]
+        padding_mask = td["padding_mask"][0] # (B, max_N)에서 [0]을 가져옴
         node_types = td["nodes"][0, :, FEATURE_INDEX["node_type"][0]:FEATURE_INDEX["node_type"][1]].argmax(-1)
         is_load = (node_types == NODE_TYPE_LOAD)
 
-        start_nodes_idx = torch.where(node_types == NODE_TYPE_LOAD)[0]
+        start_nodes_idx = torch.where(is_load & padding_mask)[0]
         return len(start_nodes_idx), start_nodes_idx
     
     def _trace_path_batch(self, start_nodes: torch.Tensor, adj_matrix: torch.Tensor) -> torch.Tensor:

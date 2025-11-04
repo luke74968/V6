@@ -4,7 +4,7 @@ import sys
 import time
 import yaml
 import json
-import randomf
+import random
 import torch
 import logging
 import argparse
@@ -28,7 +28,7 @@ def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     args.log(f"Using device: {device}")
     
-env = PocatEnv(
+    env = PocatEnv(
         generator_params={
             "config_file_path": args.config_file,
             "max_num_nodes": args.max_num_nodes  # (config.yaml에서 로드됨)
