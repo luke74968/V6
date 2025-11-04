@@ -5,7 +5,7 @@ from tensordict import TensorDict
 from torchrl.envs import EnvBase
 from typing import Optional, Dict, Union
 
-from torchrl.data import Unbounded, UnboundedDiscrete, CompositeSpec
+from torchrl.data import Unbounded, UnboundedDiscrete, Composite
 
 from .definitions import (
     SCALAR_PROMPT_FEATURE_DIM, FEATURE_DIM, FEATURE_INDEX,
@@ -54,7 +54,7 @@ class PocatEnv(EnvBase):
         """환경의 observation, action, reward 스펙을 정의합니다."""
         num_nodes = self.generator.num_nodes
         
-        self.observation_spec = CompositeSpec({
+        self.observation_spec = Composite({
             "nodes": Unbounded(shape=(num_nodes, FEATURE_DIM)),
             "scalar_prompt_features": Unbounded(shape=(SCALAR_PROMPT_FEATURE_DIM,)),
             "matrix_prompt_features": Unbounded(shape=(num_nodes, num_nodes)),
