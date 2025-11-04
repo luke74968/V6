@@ -51,8 +51,8 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=64, help="Training batch_size")
     parser.add_argument("--eval_batch_size", type=int, default=128, help="Evaluation batch size (fixed set)")
 
-    parser.add_argument("--config_file", type=str, default="configs/config.json", help="Path to POCAT config file")
-    parser.add_argument("--config_yaml", type=str, default="configs/config.yaml", help="Path to model/training config YAML")
+    parser.add_argument("--config_file", type=str, default="config.json", help="Path to POCAT config file")
+    parser.add_argument("--config_yaml", type=str, default="config.yaml", help="Path to model/training config YAML")
     parser.add_argument("--seed", type=int, default=1234, help="Random seed")
     # --- 👇 [수정] POMO 샘플링 횟수 인자 추가 ---
     parser.add_argument("--num_pomo_samples", type=int, default=8, 
@@ -79,7 +79,7 @@ if __name__ == "__main__":
 
     
     args.start_time = time.strftime("%Y-%m%d-%H%M%S", time.localtime())
-    args.result_dir = os.path.join('transformer_solver', 'result', args.start_time)
+    args.result_dir = os.path.join('result', args.start_time)
     os.makedirs(args.result_dir, exist_ok=True)
     
     logger = setup_logger(args.result_dir)

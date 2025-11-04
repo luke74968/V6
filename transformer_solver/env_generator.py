@@ -200,8 +200,7 @@ class PocatGenerator:
             features[idx, FEATURE_INDEX["t_junction_max"]] = ic_conf.get("t_junction_max", 125.0)
             # 💡 [수정] quiescent_current와 shutdown_current 값을 텐서에 추가
             features[idx, FEATURE_INDEX["quiescent_current"]] = ic_conf.get("quiescent_current", 0.0)
-            shutdown_val = ic_conf.get("shutdown_current")
-            features[idx, FEATURE_INDEX["shutdown_current"]] = shutdown_val if shutdown_val is not None else 0.0
+            features[idx, FEATURE_INDEX["shutdown_current"]] = ic_conf.get("shutdown_current", 0.0)
             features[idx, FEATURE_INDEX["op_current"]] = ic_conf.get("operating_current", 0.0)
 
             ic_type = ic_conf.get("type")
