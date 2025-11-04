@@ -1,0 +1,15 @@
+2025-09-26
+
+# Transformer solver가 학습을 하지만
+# Tree 구조가 아닌 Star 구조로 학습 ( Local minima 에 빠짐 ) 하고있음 같은 전압을 사용하는것은 잘 묶고 , 독립조건은 만족하지만 
+
+2025-09-30 
+N POMO 로 변경 (POMO N번 동시에 학습 )
+
+2025-10-03 node feature에 id 및 독립여부 추가하였으나 개선사항 없음 , lr 10-4 -> 10-7로 조정해보았으나 효과없음
+
+2025-10-10 Debug 모드로 OR-Tools Solver의 해를 Transformer 솔버가 생성 할 수 있는지 (마스킹 로직에 문제는 없는지) 검토하였으나 특이사항 없음.
+
+2025-10-16 
+idea 1.  : 특정 Action이 어떻게 수렴하는 확인좀 해보자 
+idea 2.  : Reward Function을 완성후의 결과가 아닌 edge based reward로 변경 ( 기존 state 대비 상승금액 )
