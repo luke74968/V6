@@ -33,16 +33,20 @@ class PocatEnv(EnvBase):
     # --- [개선] 버퍼 크기 동기화 함수 추가 ---
     def _ensure_buffers(self, td: TensorDict):
         """에피소드마다 그래프/로드 수가 바뀔 경우를 대비해 버퍼를 동기화합니다."""
-        num_nodes = td["nodes"].shape[1]
+        max_nodes = td["nodes"].shape[1] # (이제 max_num_nodes임)
+        num_nodes_actual = self.generator.num_nodes_actual # (실제 노드 수)
 
-        if self.arange_nodes is None or self.arange_nodes.numel() != num_nodes:
-            self.arange_nodes = torch.arange(num_nodes, device=self.device)
+        if self.arange_nodes is None or self.arange_nodes.numel() != max_nodes:
+            self.arange_nodes = torch.arange(max_nodes, device=self.device)
         
         # node_type_tensor는 config에서 오므로 고정, __init__에서 한 번만 생성되도록 수정
         if self.node_type_tensor is None:
-            node_types_list = [self.generator.config.node_types[i] for i in range(num_nodes)]
-            self.node_type_tensor = torch.tensor(node_types_list, dtype=torch.long, device=self.device)
+            node_types_list = [self.generator.config.node_types[i] for i in range(num_nodes_actual)]
+            full_types = torch.full((max_nodes,), NODE_TYPE_LOAD, dtype=torch.long, device=self.device)
+            full_types[:num_nodes_actual] = torch.tensor(node_types_list, dtype=torch.long)
+            self.node_type_tensor = full_types
 
+            
         # rail_types도 config에서 오므로 고정
         if self.rail_types is None:
             rail_type_map = {"exclusive_supplier": 1, "exclusive_path": 2}
@@ -52,22 +56,22 @@ class PocatEnv(EnvBase):
 
     def _make_spec(self):
         """환경의 observation, action, reward 스펙을 정의합니다."""
-        num_nodes = self.generator.num_nodes
+        max_nodes = self.generator.max_num_nodes
         
         self.observation_spec = CompositeSpec({
-            "nodes": Unbounded(shape=(num_nodes, FEATURE_DIM)),
+            "nodes": Unbounded(shape=(max_nodes, FEATURE_DIM)),
             "scalar_prompt_features": Unbounded(shape=(SCALAR_PROMPT_FEATURE_DIM,)),
-            "matrix_prompt_features": Unbounded(shape=(num_nodes, num_nodes)),
-            "connectivity_matrix": Unbounded(shape=(num_nodes, num_nodes), dtype=torch.bool),
-            "adj_matrix": Unbounded(shape=(num_nodes, num_nodes), dtype=torch.bool),
-            "unconnected_loads_mask": Unbounded(shape=(num_nodes,), dtype=torch.bool),
+            "matrix_prompt_features": Unbounded(shape=(max_nodes, max_nodes)),
+            "connectivity_matrix": Unbounded(shape=(max_nodes, max_nodes), dtype=torch.bool),
+            "adj_matrix": Unbounded(shape=(max_nodes, max_nodes), dtype=torch.bool),
+            "unconnected_loads_mask": Unbounded(shape=(max_nodes,), dtype=torch.bool),
             "trajectory_head": UnboundedDiscrete(shape=(1,)),
             "step_count": UnboundedDiscrete(shape=(1,)),
-            # --- 👇 [여기에 새로운 상태 명세를 추가합니다] ---
             "current_cost": Unbounded(shape=(1,)),
-            "is_used_ic_mask": Unbounded(shape=(num_nodes,), dtype=torch.bool),
-            "is_locked_ic_mask": Unbounded(shape=(num_nodes,), dtype=torch.bool),
+            "is_used_ic_mask": Unbounded(shape=(max_nodes,), dtype=torch.bool),
+            "is_locked_ic_mask": Unbounded(shape=(max_nodes,), dtype=torch.bool),
             "current_target_load": UnboundedDiscrete(shape=(1,)),
+            "padding_mask": Unbounded(shape=(max_nodes,), dtype=torch.bool),           
         })
         
         self.action_spec = UnboundedDiscrete(shape=(1,))
@@ -119,7 +123,10 @@ class PocatEnv(EnvBase):
                 self.power_sequences.append((j_idx, k_idx, f_flag))
 
     def select_start_nodes(self, td: TensorDict):
+        padding_mask = td["padding_mask"][0]
         node_types = td["nodes"][0, :, FEATURE_INDEX["node_type"][0]:FEATURE_INDEX["node_type"][1]].argmax(-1)
+        is_load = (node_types == NODE_TYPE_LOAD)
+
         start_nodes_idx = torch.where(node_types == NODE_TYPE_LOAD)[0]
         return len(start_nodes_idx), start_nodes_idx
     
@@ -171,7 +178,7 @@ class PocatEnv(EnvBase):
             # 배치 크기도 들어온 td에서 가져옵니다.
             batch_size = td_initial.batch_size[0]
 
-        num_nodes = td_initial["nodes"].shape[1]
+        max_nodes = td_initial["nodes"].shape[1]
 
         # --- 💡 1. Trajectory 기반 상태(state) 재정의 ---
         reset_td = TensorDict({
@@ -179,21 +186,25 @@ class PocatEnv(EnvBase):
             "scalar_prompt_features": td_initial["scalar_prompt_features"],
             "matrix_prompt_features": td_initial["matrix_prompt_features"],
             "connectivity_matrix": td_initial["connectivity_matrix"],
-            "adj_matrix": torch.zeros(batch_size, num_nodes, num_nodes, dtype=torch.bool, device=self.device),
+            "padding_mask": td_initial["padding_mask"], # 💡 패딩 마스크 전달
+
+            "adj_matrix": torch.zeros(batch_size, max_nodes, max_nodes, dtype=torch.bool, device=self.device),
             "trajectory_head": torch.full((batch_size, 1), BATTERY_NODE_IDX, dtype=torch.long, device=self.device),
-            "unconnected_loads_mask": torch.ones(batch_size, num_nodes, dtype=torch.bool, device=self.device),
+            "unconnected_loads_mask": torch.ones(batch_size, max_nodes, dtype=torch.bool, device=self.device),
             "step_count": torch.zeros(batch_size, 1, dtype=torch.long, device=self.device),
             # --- 👇 [여기에 새로운 상태 초기값을 추가합니다] ---
             "current_cost": torch.zeros(batch_size, 1, dtype=torch.float32, device=self.device),
-            "is_used_ic_mask": torch.zeros(batch_size, num_nodes, dtype=torch.bool, device=self.device),
-            "is_locked_ic_mask": torch.zeros(batch_size, num_nodes, dtype=torch.bool, device=self.device),
+            "is_used_ic_mask": torch.zeros(batch_size, max_nodes, dtype=torch.bool, device=self.device),
+            "is_locked_ic_mask": torch.zeros(batch_size, max_nodes, dtype=torch.bool, device=self.device),
             "current_target_load": torch.full((batch_size, 1), -1, dtype=torch.long, device=self.device),
         }, batch_size=[batch_size], device=self.device)
        
         # 배터리(인덱스 0)는 항상 메인 트리에 포함
-        node_types = td_initial["nodes"][0, :, FEATURE_INDEX["node_type"][0]:FEATURE_INDEX["node_type"][1]].argmax(-1)
-        is_load = node_types == NODE_TYPE_LOAD
-        reset_td["unconnected_loads_mask"][:, ~is_load] = False
+        num_nodes_actual = self.generator.num_nodes_actual
+        node_types_actual = td_initial["nodes"][0, :num_nodes_actual, FEATURE_INDEX["node_type"][0]:FEATURE_INDEX["node_type"][1]].argmax(-1)
+        is_load_actual = (node_types_actual == NODE_TYPE_LOAD)
+
+        reset_td["unconnected_loads_mask"][:, num_nodes_actual:] = False
         reset_td.set("done", torch.zeros(batch_size, 1, dtype=torch.bool, device=self.device))
         return reset_td
 
@@ -347,7 +358,7 @@ class PocatEnv(EnvBase):
         all_loads_connected = (next_obs["unconnected_loads_mask"].sum(dim=1) == 0)
         trajectory_finished = (next_obs["trajectory_head"].squeeze(-1) == BATTERY_NODE_IDX)
         done_successfully = all_loads_connected & trajectory_finished
-        max_steps = 2 * self.generator.num_nodes
+        max_steps = 2 * self.generator.num_nodes_actual
         timed_out = (next_obs["step_count"] > max_steps).squeeze(-1)
         is_done = done_successfully | timed_out | is_stuck_or_finished
         next_obs["done"] = is_done.unsqueeze(-1)
@@ -379,6 +390,10 @@ class PocatEnv(EnvBase):
             is_finished = head_is_battery & ~all_has_unconnected
             mask[is_active] = td["unconnected_loads_mask"][is_active]
             mask[is_finished, BATTERY_NODE_IDX] = True
+
+            final_mask = mask & td["padding_mask"]
+            final_mask[:, BATTERY_NODE_IDX] = mask[:, BATTERY_NODE_IDX] # 배터리 상태 복원
+
             if debug:
                 return {"mask": mask, "reasons": {}}
             return mask
@@ -514,6 +529,9 @@ class PocatEnv(EnvBase):
                             can_be_parent[inst_constr] &= ~same_parent_mask
 
             mask[head_is_node] = can_be_parent
+
+        final_mask = mask & td["padding_mask"]
+        
         if debug:
             reasons = {
                 "Not Load": not_load_parent[0],
@@ -522,11 +540,12 @@ class PocatEnv(EnvBase):
                 "Cycle OK": cycle_ok[0],
                 "Current OK": current_ok[0],
                 "Exclusive OK": exclusive_ok[0],
-                "Sequence OK": mask[0]
+                "Sequence OK": mask[0],
+                "Padding OK": td["padding_mask"][0] # 디버그에 패딩 마스크 추가
             }
-            return {"mask": mask, "reasons": reasons}
+            return {"mask": final_mask, "reasons": reasons}
             
-        return mask
+        return final_mask
 
 
     

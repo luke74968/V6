@@ -82,7 +82,7 @@ if __name__ == "__main__":
             setattr(args, key, value)
 
     if not hasattr(args, 'max_num_nodes'):
-            raise ValueError("config.yaml에 'max_num_nodes'가 정의되지 않았습니다.")
+        raise ValueError("config.yaml에 'max_num_nodes'가 정의되지 않았습니다.")
 
     args.ddp = False
     

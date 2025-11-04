@@ -1,3 +1,6 @@
+0. Ubuntu-24.04 에서 구현
+# python3-venv 설치 필요 
+sudo apt install -y python3-venv
 1. 초기 셋업
 # 가상환경 생성
 python3 -m venv .venv

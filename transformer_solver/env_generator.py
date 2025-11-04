@@ -106,8 +106,6 @@ class PocatGenerator:
         with open(config_file_path, "r", encoding='utf-8') as f:
             config_data = json.load(f)
 
-        # --- 💡 2. 지능적인 인스턴스 확장 로직 실행 ---
-        # 먼저 설정 파일로부터 원본 객체들을 생성
         battery_obj = Battery(**config_data['battery'])
         loads_obj = [Load(**ld) for ld in config_data['loads']]
         
@@ -148,10 +146,10 @@ class PocatGenerator:
         if self.num_nodes_actual > self.max_num_nodes:
             raise ValueError(
                 f"문제의 실제 노드 수({self.num_nodes_actual})가 "
-                f"설정된 최대 노드 수({self.max_num_nodes})보다 큽니다."
+                f"설정된 최대 노드 수({self.max_num_nodes})보다 큽니다. "
+                f"config.yaml의 max_num_nodes 값을 늘려주세요."
             )
 
-        self.num_nodes = len(self.config.node_names)
         self.num_loads = len(self.config.loads)
         self.num_ics = len(self.config.available_ics)
 
@@ -162,29 +160,36 @@ class PocatGenerator:
 
     def _initialize_base_tensors(self) -> None:
         """Pre-compute reusable tensors used to build batches."""
-        node_features = self._create_feature_tensor()
-        connectivity_matrix = self._create_connectivity_matrix(node_features)
-        scalar_prompt_features, matrix_prompt_features = self._create_prompt_tensors()
-
+        node_features = self._create_feature_tensor() # (max_N, Feat_Dim)
+        connectivity_matrix = self._create_connectivity_matrix(node_features) # (max_N, max_N)
+        scalar_prompt_features, matrix_prompt_features = self._create_prompt_tensors() # (S), (max_N, max_N)
+        
+        
+        # 💡 [추가] 패딩 마스크 생성
+        # (실제 노드: True, 패딩 노드: False)
+        padding_mask = torch.zeros(self.max_num_nodes, dtype=torch.bool)
+        padding_mask[:self.num_nodes_actual] = True
         # Ensure tensors are detached and not tracked by autograd
         self._base_tensors = {
             "nodes": node_features.detach(),
             "connectivity_matrix": connectivity_matrix.detach(),
             "scalar_prompt_features": scalar_prompt_features.detach(),
             "matrix_prompt_features": matrix_prompt_features.detach(),
+            "padding_mask": padding_mask.detach(), # 마스크도 저장
         }
 
         base_device = node_features.device
         self._tensor_cache_by_device[base_device] = self._base_tensors
 
     def _create_feature_tensor(self) -> torch.Tensor:
-        features = torch.zeros(self.num_nodes, FEATURE_DIM)
+        features = torch.zeros(self.max_num_nodes, FEATURE_DIM)
         ambient_temp = self.config.constraints.get("ambient_temperature", 25.0)
-        for idx in range(self.num_nodes):
-            features[idx, FEATURE_INDEX["node_id"]] = float(idx) / self.num_nodes
+        
+        for idx in range(self.num_nodes_actual):
+            features[idx, FEATURE_INDEX["node_id"]] = float(idx) / self.num_nodes_actual
 
         # 모든 노드의 초기 온도는 주변 온도로 설정
-        features[:, FEATURE_INDEX["junction_temp"]] = ambient_temp
+        features[:self.num_nodes_actual, FEATURE_INDEX["junction_temp"]] = ambient_temp
         
         battery_conf = self.config.battery
         features[0, FEATURE_INDEX["node_type"][0] + NODE_TYPE_BATTERY] = 1.0
@@ -245,11 +250,16 @@ class PocatGenerator:
         노드 피처를 기반으로 물리적으로 연결 가능한 엣지를 나타내는 인접 행렬을 생성합니다.
         (전압 호환성 기반)
         """
-        num_nodes = node_features.shape[0]
+        num_nodes = self.max_num_nodes
+
+        # 💡 [수정] 실제 노드 수까지만 마스크 계산
+        actual_nodes_mask = torch.zeros(num_nodes, dtype=torch.bool)
+        actual_nodes_mask[:self.num_nodes_actual] = True
+        
         node_types = node_features[:, FEATURE_INDEX["node_type"][0]:FEATURE_INDEX["node_type"][1]].argmax(-1)
         
-        is_parent = (node_types == NODE_TYPE_IC) | (node_types == NODE_TYPE_BATTERY)
-        is_child = (node_types == NODE_TYPE_IC) | (node_types == NODE_TYPE_LOAD)
+        is_parent = ((node_types == NODE_TYPE_IC) | (node_types == NODE_TYPE_BATTERY)) & actual_nodes_mask
+        is_child = ((node_types == NODE_TYPE_IC) | (node_types == NODE_TYPE_LOAD)) & actual_nodes_mask
         
         parent_mask = is_parent.unsqueeze(1).expand(-1, num_nodes)
         child_mask = is_child.unsqueeze(0).expand(num_nodes, -1)
@@ -277,7 +287,7 @@ class PocatGenerator:
         ]
         scalar_prompt_features = torch.tensor(scalar_prompt_list, dtype=torch.float32)
 
-        matrix_prompt_features = torch.zeros(self.num_nodes, self.num_nodes, dtype=torch.float32)
+        matrix_prompt_features = torch.zeros(self.max_num_nodes, self.max_num_nodes, dtype=torch.float32)
         node_name_to_idx = {name: i for i, name in enumerate(self.config.node_names)}
 
         for seq in constraints.get("power_sequences", []):
@@ -319,10 +329,12 @@ class PocatGenerator:
         scalar_prompt = base_tensors["scalar_prompt_features"].detach().unsqueeze(0).expand(batch_size, -1).clone()
         matrix_prompt = base_tensors["matrix_prompt_features"].detach().unsqueeze(0).expand(batch_size, -1, -1).clone()
         connectivity = base_tensors["connectivity_matrix"].detach().unsqueeze(0).expand(batch_size, -1, -1).clone()
+        padding_mask = base_tensors["padding_mask"].detach().unsqueeze(0).expand(batch_size, -1).clone()
         
         return TensorDict({
             "nodes": nodes,
             "scalar_prompt_features": scalar_prompt,
             "matrix_prompt_features": matrix_prompt,
-            "connectivity_matrix": connectivity
+            "connectivity_matrix": connectivity,
+            "padding_mask": padding_mask, # 💡 패딩 마스크를 텐서 사전에 추가
         }, batch_size=[batch_size])

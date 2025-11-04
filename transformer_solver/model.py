@@ -92,12 +92,15 @@ def multi_head_attention(q, k, v, attention_mask=None, sparse_type=None):
             # (batch, query_len, key_len) -> (batch, 1, query_len, key_len)
             attention_mask = attention_mask.unsqueeze(1)
         elif attention_mask.dim() == 2:
-            # (query_len, key_len) -> (batch, 1, 1, query_len, key_len)
-            attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+            if attention_mask.size(0) == batch_s: # (B, N) 형태
+                attention_mask = attention_mask.unsqueeze(1).unsqueeze(2) # (B, 1, 1, N)
+                # K_len (N)에 대해 마스킹하고, Q_len (N)에 대해서도 마스킹
+                attention_mask = attention_mask.transpose(-1, -2) & attention_mask
+            else: # (N, N) 형태
+                attention_mask = attention_mask.unsqueeze(0).unsqueeze(1) # (1, 1, N, N)
         
         # attention_mask의 값이 0인 모든 위치를 -inf로 채웁니다.
         score_scaled = score_scaled.masked_fill(attention_mask == 0, -1e12)
-
 
         
     if sparse_type == 'topk':
@@ -144,7 +147,7 @@ class EncoderLayer(nn.Module):
         return self.normalization2(h + self.feed_forward(h))
 
 class PocatPromptNet(nn.Module):
-    def __init__(self, embedding_dim: int, num_nodes: int, **kwargs):
+    def __init__(self, embedding_dim: int, max_num_nodes: int, **kwargs):
         super().__init__()
         # 1. 스칼라 제약조건(4개)을 위한 네트워크
         self.scalar_net = nn.Sequential(
@@ -155,7 +158,7 @@ class PocatPromptNet(nn.Module):
         
         # 2. 시퀀스 제약 행렬(num_nodes * num_nodes)을 위한 네트워크
         self.matrix_net = nn.Sequential(
-            nn.Linear(num_nodes * num_nodes, embedding_dim),
+            nn.Linear(max_num_nodes * max_num_nodes, embedding_dim),
             nn.ReLU(),
             nn.Linear(embedding_dim, embedding_dim // 2)
         )
@@ -233,14 +236,20 @@ class PocatEncoder(nn.Module):
         
         connectivity_mask = td['connectivity_matrix']
         global_input = torch.cat((node_embeddings, prompt_embedding), dim=1)
-        global_attention_mask = torch.ones(batch_size, num_nodes + 1, num_nodes + 1, dtype=torch.bool, device=node_embeddings.device)
-        global_attention_mask[:, :num_nodes, :num_nodes] = connectivity_mask
+
+        pad_mask_nodes = td["padding_mask"]
+        batch_size, num_nodes = pad_mask_nodes.shape
+        pad_mask_prompt = torch.ones(batch_size, 1, dtype=torch.bool, device=pad_mask_nodes.device)
+        full_pad_mask = torch.cat([pad_mask_nodes, pad_mask_prompt], dim=1) # (B, max_N+1)
+        
+        global_attention_mask = full_pad_mask.unsqueeze(2) & full_pad_mask.unsqueeze(1)
+        global_attention_mask[:, :num_nodes, :num_nodes] |= connectivity_mask
         
         sparse_out, global_out = node_embeddings, global_input
         for i in range(len(self.sparse_layers)):
-            sparse_out = self.sparse_layers[i](sparse_out, attention_mask=connectivity_mask)
+            sparse_attention_mask = connectivity_mask
+            sparse_out = self.sparse_layers[i](sparse_out, attention_mask=sparse_attention_mask)
             global_out = self.global_layers[i](global_out, attention_mask=global_attention_mask)
-            sparse_out = sparse_out + self.sparse_fusion[i](global_out[:, :num_nodes])
             if i < len(self.global_layers) - 1:
                 global_nodes = global_out[:, :num_nodes] + self.global_fusion[i](sparse_out)
                 global_out = torch.cat((global_nodes, global_out[:, num_nodes:]), dim=1)  
@@ -285,7 +294,10 @@ class PocatModel(nn.Module):
         super().__init__()
         self.logit_clipping = model_params.get('logit_clipping', 10)
 
-        self.prompt_net = PocatPromptNet(embedding_dim=model_params['embedding_dim'], num_nodes=model_params['num_nodes'])
+        self.prompt_net = PocatPromptNet(
+            embedding_dim=model_params['embedding_dim'], 
+            max_num_nodes=model_params['max_num_nodes']
+        )
         self.encoder = PocatEncoder(**model_params)
         self.decoder = PocatDecoder(**model_params)
         # 💡 [CaDA 장점 적용 4] GRUCell 제거 (상태 기반 쿼리로 대체)
