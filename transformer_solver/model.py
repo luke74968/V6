@@ -318,7 +318,9 @@ class PocatModel(nn.Module):
         num_total_loads = env.generator.num_loads
         
         batch_size = td.batch_size[0]
-        td = batchify(td, num_starts)
+        
+        td_expanded_view = batchify(td, num_starts)
+        td = td_expanded_view.clone()
         # 캐시도 POMO에 맞게 확장
         cache = cache.batchify(num_starts)
 
@@ -341,7 +343,14 @@ class PocatModel(nn.Module):
             # tanh 함수를 이용해 score를 -1과 1 사이로 압축하고,
             # clipping 값(10)을 곱해 최종 score가 -10과 10 사이를 넘지 않도록 제한합니다.
             scores = self.logit_clipping * torch.tanh(scores)
-            mask = env.get_action_mask(td)
+            # --- 💡 [수정] log_mode == 'detail'일 때 디버그 모드로 마스크와 이유를 함께 가져옴 ---
+            mask_info = None
+            if log_mode == 'detail' and log_fn:
+                mask_info = env.get_action_mask(td, debug=True)
+                mask = mask_info["mask"]
+            else:
+                mask = env.get_action_mask(td)
+            # --- 수정 완료 ---
             # log_mode에 따라 다른 로그 출력
             if log_mode == 'detail' and log_fn:
                 # 안전장치: log_idx가 배치 크기를 벗어나지 않도록 확인
@@ -351,7 +360,11 @@ class PocatModel(nn.Module):
                 head_idx = td["trajectory_head"][log_idx].item()
                 head_name = node_names[head_idx]
                 
-                log_msg = f"--- Step {decoding_step}: "
+                # 💡 [수정] log_idx의 POMO 시작 노드 이름 표시
+                pomo_start_node_idx = start_nodes_idx[log_idx % num_starts].item()
+                pomo_start_node_name = node_names[pomo_start_node_idx]
+                log_msg = f"--- [Log Instance {log_idx} (Start: {pomo_start_node_name})] Step {decoding_step}: "
+
                 if head_idx == BATTERY_NODE_IDX:
                     log_msg += f"Head is at '{head_name}'. Action Type: [Select New Load]"
                 else:
@@ -365,7 +378,59 @@ class PocatModel(nn.Module):
 
                 valid_node_indices = torch.where(mask[log_idx])[0]
                 valid_scores = instance_scores[mask[log_idx]]
-                
+
+                # --- 💡 [추가] debug_env.py 스타일로 마스킹 이유 출력 ---
+                if mask_info and mask_info["reasons"]:
+
+                    reason_keys = list(mask_info["reasons"].keys())
+                    reasons = mask_info["reasons"]
+                    
+                    if not reason_keys:
+                        log_fn("    - (No masking reasons returned by environment)")
+                    elif "Not Load" in reason_keys: # [Find Parent] 모드
+                        # 💡 [핵심 수정] "Find Parent" 모드일 때 "Unconnected Load" 키가 섞여있으면 제거
+                        if "Unconnected Load" in reason_keys:
+                            reason_keys.remove("Unconnected Load")
+                        # 💡 [핵심 수정] 전역 log_idx를 지역 local_idx로 변환
+                        current_head = td["trajectory_head"].squeeze(-1)
+                        head_is_battery = (current_head == BATTERY_NODE_IDX)
+                        b_idx_node = torch.where(~head_is_battery)[0] # "Find Parent" 모드인 전역 인덱스 목록
+                        
+                        local_idx_matches = (b_idx_node == log_idx).nonzero()
+                        
+                        if local_idx_matches.numel() > 0:
+                            local_idx = local_idx_matches[0, 0].item() # reasons 텐서에서 읽어올 실제 행(row)
+                            
+
+
+                            header = f"{'Node Name':<50} | {'VALID?':<8} | " + " | ".join(f"{k:<10}" for k in reason_keys)
+                            log_fn("\n    --- Masking Details (Mode: Find Parent) ---")
+                            log_fn(header)
+                            log_fn("-" * len(header))
+
+                            for node_idx, node_name in enumerate(node_names):
+                                is_valid = mask[log_idx, node_idx].item()
+                                reason_str_parts = []
+                                for k in reason_keys:
+                                    tensor = reasons[k]
+                                    value = tensor[node_idx] if tensor.ndim == 1 else tensor[local_idx, node_idx]
+                                    reason_str_parts.append(f"{('✅' if value else '❌'):<10}")
+                                reason_str = " | ".join(reason_str_parts)                                
+                                log_fn(f"{node_name:<50} | {('✅ YES' if is_valid else '❌ NO'):<8} | {reason_str}")
+                        else:
+                            log_fn(f"    - (Error: Log instance {log_idx} not found in 'Find Parent' batch)")
+                    
+                    elif "Unconnected Load" in reason_keys: # [Select New Load] 모드
+                        reasons_for_instance = {k: v[log_idx] for k, v in reasons.items() if v.ndim == 2 and v.shape[0] > log_idx}                        
+                        log_fn("\n    --- Masking Details (Mode: Select New Load) ---")
+                        log_fn(f"{'Node Name':<50} | {'VALID?':<8} | Unconnected Load")
+                        log_fn("-" * 79)
+                        for node_idx, node_name in enumerate(node_names):
+                            is_valid = mask[log_idx, node_idx].item()
+                            if "Unconnected Load" in reasons_for_instance and reasons_for_instance["Unconnected Load"][node_idx].item():
+                                log_fn(f"{node_name:<50} | {('✅ YES' if is_valid else '❌ NO'):<8} | {'✅' if is_unconnected else '❌'}")
+                # --- 마스킹 이유 출력 완료 ---
+
                 if len(valid_scores) > 0:
                     # Softmax 함수를 적용하여 점수를 확률로 변환합니다.
                     valid_probs = F.softmax(valid_scores, dim=0)
@@ -373,13 +438,19 @@ class PocatModel(nn.Module):
                     # 점수를 기준으로 내림차순 정렬합니다.
                     sorted_indices = torch.argsort(valid_scores, descending=True)
                     
-                    log_fn("    - All Valid Action Scores (pre-mask):")
+                    log_fn("\n    - Top Valid Action Probabilities (for Log Instance):")
                     # 정렬된 순서대로 모든 유효 액션을 출력합니다.
-                    for i in sorted_indices:
-                        node_idx = valid_node_indices[i].item()
-                        prob = valid_probs[i].item() 
+                    for i, sorted_idx in enumerate(sorted_indices):
+                        node_idx = valid_node_indices[sorted_idx].item()
+                        prob = valid_probs[sorted_idx].item()
                         node_name = node_names[node_idx]
                         log_fn(f"        - {node_name:<40s} | Probability: {prob:.2%}")
+                        # 상위 5개까지만 출력
+                        if i >= 4:
+                            log_fn(f"        - ... (and {len(sorted_indices) - 5} more)")
+                            break 
+                else:
+                    log_fn("    - ❌ No valid actions found for this instance!")
 
             elif log_mode == 'progress' and pbar:
                 unconnected_loads = td['unconnected_loads_mask'][0].sum().item()

@@ -79,7 +79,7 @@ if __name__ == "__main__":
 
     
     args.start_time = time.strftime("%Y-%m%d-%H%M%S", time.localtime())
-    args.result_dir = os.path.join('result', args.start_time)
+    args.result_dir = os.path.join('transformer_solver', 'result', args.start_time)
     os.makedirs(args.result_dir, exist_ok=True)
     
     logger = setup_logger(args.result_dir)

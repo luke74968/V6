@@ -66,7 +66,6 @@ class PocatEnv(EnvBase):
             # --- 👇 [여기에 새로운 상태 명세를 추가합니다] ---
             "current_cost": Unbounded(shape=(1,)),
             "is_used_ic_mask": Unbounded(shape=(num_nodes,), dtype=torch.bool),
-            "is_locked_ic_mask": Unbounded(shape=(num_nodes,), dtype=torch.bool),
             "current_target_load": UnboundedDiscrete(shape=(1,)),
         })
         
@@ -186,7 +185,6 @@ class PocatEnv(EnvBase):
             # --- 👇 [여기에 새로운 상태 초기값을 추가합니다] ---
             "current_cost": torch.zeros(batch_size, 1, dtype=torch.float32, device=self.device),
             "is_used_ic_mask": torch.zeros(batch_size, num_nodes, dtype=torch.bool, device=self.device),
-            "is_locked_ic_mask": torch.zeros(batch_size, num_nodes, dtype=torch.bool, device=self.device),
             "current_target_load": torch.full((batch_size, 1), -1, dtype=torch.long, device=self.device),
         }, batch_size=[batch_size], device=self.device)
        
@@ -228,7 +226,14 @@ class PocatEnv(EnvBase):
         batch_size, num_nodes, _ = td["nodes"].shape
         action = td["action"].reshape(batch_size)
         current_head = td["trajectory_head"].reshape(batch_size)
-        next_obs = td.clone()
+
+        # 💡 [핵심 수정] 얕은 복사 대신, 수정될 텐서만 깊은 복사(deep copy)
+        next_obs = td.clone() # 껍데기는 얕은 복사
+        next_obs["nodes"] = td["nodes"].clone()
+        next_obs["adj_matrix"] = td["adj_matrix"].clone()
+        next_obs["is_used_ic_mask"] = td["is_used_ic_mask"].clone()
+        next_obs["current_target_load"] = td["current_target_load"].clone()
+
         batch_indices = torch.arange(batch_size, device=self.device)
 
         # 1. 액션 타입에 따라 상태 업데이트
@@ -258,26 +263,6 @@ class PocatEnv(EnvBase):
                 ic_indices = parent_node[is_parent_ic]
                 next_obs["is_used_ic_mask"][ic_rows, ic_indices] = True
 
-            # 3. [핵심] Independent 조건에 따라 '잠금' 상태 업데이트
-            target_load_idx = td["current_target_load"].squeeze(-1)[head_is_node]
-            load_configs = self.generator.config.loads
-            load_start_idx = 1 + self.generator.num_ics
-
-            for i, b_idx in enumerate(node_rows):
-                target_idx = target_load_idx[i].item()
-                if target_idx == -1: continue
-                
-                config_idx = target_idx - load_start_idx
-                if 0 <= config_idx < len(load_configs):
-                    rail_type = load_configs[config_idx].get("independent_rail_type")
-                    p_idx = parent_node[i].item() # 선택된 부모 IC
-
-                    if rail_type == "exclusive_supplier" and child_node[i].item() == target_idx:
-                        # 부하의 '직접' 부모만 잠금
-                        next_obs["is_locked_ic_mask"][b_idx, p_idx] = True
-                    elif rail_type == "exclusive_path":
-                        # 경로상의 모든 IC를 잠금
-                        next_obs["is_locked_ic_mask"][b_idx, p_idx] = True
 
             # 4. 다음 헤드 결정 및 작업 목표 초기화
             parent_is_battery = (parent_node == BATTERY_NODE_IDX)
@@ -365,9 +350,12 @@ class PocatEnv(EnvBase):
         batch_size, num_nodes, _ = td["nodes"].shape
         mask = torch.zeros(batch_size, num_nodes, dtype=torch.bool, device=self.device)
         current_head = td["trajectory_head"].squeeze(-1)
+        
+        # 💡 [수정] debug 모드일 때 reasons 딕셔너리를 미리 초기화
+        reasons = {}
 
         # 💡 디버깅 로그를 위한 설정
-        is_debug_instance = td.batch_size[0] > 0 and td.get("log_mode", "progress") == "detail"
+        is_debug_instance = td.batch_size[0] > 0 and td.get("log_mode", "detail") == "detail"
         debug_idx = td.get("log_idx", 0) if is_debug_instance else -1
 
 
@@ -379,9 +367,13 @@ class PocatEnv(EnvBase):
             is_finished = head_is_battery & ~all_has_unconnected
             mask[is_active] = td["unconnected_loads_mask"][is_active]
             mask[is_finished, BATTERY_NODE_IDX] = True
+            # 💡 [수정] Select New Load 모드일 때도 reasons를 반환하도록 수정
             if debug:
-                return {"mask": mask, "reasons": {}}
-            return mask
+                # [Select New Load] 모드의 reasons는 단순함
+                reasons = {"Unconnected Load": td["unconnected_loads_mask"]}
+                # [Find Parent] 모드의 reasons는 아래에서 생성됨
+            else: # debug=False
+                return mask
 
         # --- 2. [Find Parent] 모드 마스킹 (모든 조건을 한번에 계산) ---
         head_is_node = ~head_is_battery
@@ -419,8 +411,6 @@ class PocatEnv(EnvBase):
             child_current_draw = nodes_slice[rows, child_nodes, FEATURE_INDEX["current_active"]].unsqueeze(1)
             current_ok = (remaining_capacity >= child_current_draw) | is_battery_mask
 
-            # 조건 4: Independent Rail (전역 규칙 - 잠긴 IC 제외)
-            not_locked = ~td["is_locked_ic_mask"][b_idx_node] | is_battery_mask
 
             # 조건 5: Independent Rail (상황 규칙 - exclusive 경로의 경우 사용된 IC 제외)
             target_load_idx = td["current_target_load"].squeeze(-1)[head_is_node]
@@ -440,34 +430,44 @@ class PocatEnv(EnvBase):
                     temp_types[in_range_mask] = self.rail_types[final_indices].to(self.device)
                     target_rail_types[valid_target_mask] = temp_types
 
-            # `exclusive_supplier` (type 1)
-            children_count = td["adj_matrix"][b_idx_node].sum(dim=-1)
-            is_parent_free = (children_count == 0)
-            is_exclusive_supplier = (target_rail_types == 1).unsqueeze(1)
-            supplier_ok = ~(is_exclusive_supplier & ~(is_parent_free | is_battery_mask))
+            # --- 👇 [핵심 수정] 파트너님의 규칙("Exclusive는 무조건 단독 점유") 기반 로직 ---
+            # 1. 현재 타겟 로드의 타입을 확인 (target_rail_types는 위에서 계산됨)
+            is_supplier_target = (target_rail_types == 1).unsqueeze(1)
+            is_path_target = (target_rail_types == 2).unsqueeze(1)
+            is_normal_target = (target_rail_types == 0).unsqueeze(1)
+            
+            is_exclusive_target = is_supplier_target | is_path_target
 
-            # `exclusive_path` (type 2)
-            is_used_mask_slice = td["is_used_ic_mask"][b_idx_node]
-            is_exclusive_path = (target_rail_types == 2).unsqueeze(1)
-            path_ok = ~(is_exclusive_path & is_used_mask_slice & ~is_battery_mask)
+            # 2. 각 부모 IC가 어떤 타입의 자식을 가지고 있는지 스캔 (adj_matrix 기반)
+            # (load_start_idx는 위에서 계산됨)
+            load_end_idx = load_start_idx + self.generator.num_loads
+            
+            adj_matrix_load_children = td["adj_matrix"][b_idx_node, :, load_start_idx:load_end_idx]
+            rail_types_broadcast = self.rail_types.view(1, 1, -1).expand(B_act, num_nodes, -1)
 
-            exclusive_ok = supplier_ok & path_ok & not_locked
+            has_path_child = (adj_matrix_load_children & (rail_types_broadcast == 2)).any(dim=-1)
+            has_supplier_child = (adj_matrix_load_children & (rail_types_broadcast == 1)).any(dim=-1)
+            has_normal_child = (adj_matrix_load_children & (rail_types_broadcast == 0)).any(dim=-1)
+            has_ic_child = td["adj_matrix"][b_idx_node, :, 1:load_start_idx].any(dim=-1)
+            
+            has_any_exclusive_child = has_path_child | has_supplier_child
+            is_parent_free = ~(has_any_exclusive_child | has_normal_child | has_ic_child)
+
+            # 3. 마스킹 규칙 적용
+            # 규칙 A: 타겟이 'exclusive'(path/supplier)라면, 부모는 *반드시* 비어있어야 함
+            rule_A_ok = ~(is_exclusive_target & ~is_parent_free)
+            # 규칙 B: 타겟이 'normal'이라면, 부모는 'exclusive' 자식을 *절대* 가질 수 없음
+            rule_B_ok = ~(is_normal_target & has_any_exclusive_child)
+
+            exclusive_ok = (rule_A_ok & rule_B_ok) | is_battery_mask
+            # --- 👆 [핵심 수정 완료] ---
+
 
             # --- 모든 벡터화 가능 조건을 단 한 번의 연산으로 결합 ---
-            if debug:
-                reasons = {
-                    "not_load_parent": not_load_parent, "not_self_parent": not_self_parent,
-                    "volt_ok": volt_ok, "cycle_ok": cycle_ok, "current_ok": current_ok,
-                    "exclusive_ok": exclusive_ok,
-                }
-                can_be_parent = torch.ones_like(volt_ok, dtype=torch.bool)
-                for v in reasons.values():
-                    can_be_parent &= v
-            else:
-                can_be_parent = (
-                    not_load_parent & not_self_parent & volt_ok & cycle_ok & 
-                    current_ok & exclusive_ok
-                )
+            can_be_parent = (
+                not_load_parent & not_self_parent & volt_ok & cycle_ok & 
+                current_ok & exclusive_ok 
+            )
 
             # --- 2-2. 루프가 필요한 Power Sequence만 따로 처리 ---
             for j_idx, k_idx, f_flag in self.power_sequences:
@@ -514,19 +514,26 @@ class PocatEnv(EnvBase):
                             can_be_parent[inst_constr] &= ~same_parent_mask
 
             mask[head_is_node] = can_be_parent
+
+
+            
         if debug:
-            reasons = {
-                "Not Load": not_load_parent[0],
-                "Not Self": not_self_parent[0],
-                "Volt OK": volt_ok[0],
-                "Cycle OK": cycle_ok[0],
-                "Current OK": current_ok[0],
-                "Exclusive OK": exclusive_ok[0],
-                "Sequence OK": mask[0]
-            }
+            if not head_is_node.any():
+                # [Select New Load] 모드였다면, 위에서 생성된 reasons 반환
+                return {"mask": mask, "reasons": reasons}
+
+            reasons.update({ # [Find Parent] 모드 이유를 덮어쓰기
+                     "Not Load": not_load_parent,
+                     "Not Self": not_self_parent, # 💡 [복원] 디버깅 테이블에 필수적인 키
+                     "Volt OK": volt_ok,
+                     "Cycle OK": cycle_ok,
+                     "Current OK": current_ok,
+                     "Exclusive OK": exclusive_ok,
+                     "Sequence OK": can_be_parent # Power Sequence까지 적용된 최종본
+                 })
             return {"mask": mask, "reasons": reasons}
             
-        return mask
+        return mask # 디버그 모드가 아닐 때
 
 
     
