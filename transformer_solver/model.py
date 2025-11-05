@@ -428,6 +428,7 @@ class PocatModel(nn.Module):
                         for node_idx, node_name in enumerate(node_names):
                             is_valid = mask[log_idx, node_idx].item()
                             if "Unconnected Load" in reasons_for_instance and reasons_for_instance["Unconnected Load"][node_idx].item():
+                                is_unconnected = reasons_for_instance["Unconnected Load"][node_idx].item()
                                 log_fn(f"{node_name:<50} | {('✅ YES' if is_valid else '❌ NO'):<8} | {'✅' if is_unconnected else '❌'}")
                 # --- 마스킹 이유 출력 완료 ---
 
