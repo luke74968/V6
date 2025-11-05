@@ -278,7 +278,8 @@ class PocatDecoder(nn.Module):
         mha_out = multi_head_attention(q, cache.glimpse_key, cache.glimpse_val)
         mh_atten_out = self.multi_head_combine(mha_out)
         scores = torch.matmul(mh_atten_out, cache.logit_key).squeeze(1) / (self.embedding_dim ** 0.5)
-        return scores
+        return scores, None # A2C와 호환성을 위해 None을 반환 (REINFORCE에서는 사용 안 함)
+
 
 class PocatModel(nn.Module):
     def __init__(self, **model_params):
@@ -334,12 +335,19 @@ class PocatModel(nn.Module):
 
         log_probs, actions = [torch.zeros(td.batch_size[0], device=td.device)], [action]
 
+        # --- 👇 [핵심 1] 스텝별 Reward도 수집 ---
+        log_probs, actions = [], []
+        rewards = []
+        # 첫 번째 'action' (POMO 시작 노드 설정)은 보상이나 log_prob이 없으므로
+        # actions 리스트에만 추가합니다.
+        actions.append(action)
+        # --- 수정 완료 ---
 
         decoding_step = 0
         while not td["done"].all():
             decoding_step += 1
             
-            scores = self.decoder(td, cache)
+            scores, _ = self.decoder(td, cache)
             # tanh 함수를 이용해 score를 -1과 1 사이로 압축하고,
             # clipping 값(10)을 곱해 최종 score가 -10과 10 사이를 넘지 않도록 제한합니다.
             scores = self.logit_clipping * torch.tanh(scores)
@@ -352,7 +360,7 @@ class PocatModel(nn.Module):
                 mask = env.get_action_mask(td)
             # --- 수정 완료 ---
             # log_mode에 따라 다른 로그 출력
-            if log_mode == 'detail' and log_fn:
+            if log_mode == 'detail' and log_fn and (log_idx < td.batch_size[0]): # log_idx 범위 체크 추가
                 # 안전장치: log_idx가 배치 크기를 벗어나지 않도록 확인
                 if log_idx >= td.batch_size[0]:
                     log_idx = 0
@@ -487,14 +495,17 @@ class PocatModel(nn.Module):
                 log_fn("-" * 20)
 
             td.set("action", action.unsqueeze(-1))
-            output_td = env.step(td)
+            output_td = env.step(td) # env.step() 호출
+            reward = output_td["reward"]
             td = output_td["next"]
             
-            actions.append(action.unsqueeze(-1))
             log_probs.append(log_prob.gather(1, action.unsqueeze(-1)).squeeze(-1))
+            actions.append(action.unsqueeze(-1))
+            
+            rewards.append(reward)
 
         return {
-            "reward": output_td["reward"],
+            "reward": torch.stack(rewards, 1).sum(1), # [B_total, T] -> [B_total]
             "log_likelihood": torch.stack(log_probs, 1).sum(1),
-            "actions": torch.stack(actions, 1)
+            "actions": torch.stack(actions, 1) # [B_total, T+1] (첫 액션 포함)
         }

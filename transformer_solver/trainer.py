@@ -174,7 +174,10 @@ class PocatTrainer:
                 
                 # 💡 **[변경 2]** 현재 배치의 평균 비용과 최소 비용 계산
                 avg_cost = -avg_of_bests.mean().item()
-                min_batch_cost = -avg_of_bests.max().item()
+                # --- 👇 [핵심 수정] ---
+                # 'reward' 텐서(모든 샘플/시작노드의 보상)에서 가장 높은 보상(=가장 낮은 비용)을 찾습니다.
+                min_batch_cost = -reward.max().item()
+                # --- 수정 완료 --
                 min_epoch_cost = min(min_epoch_cost, min_batch_cost)
 
 

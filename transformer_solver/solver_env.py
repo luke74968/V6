@@ -12,6 +12,18 @@ from .definitions import (
     NODE_TYPE_BATTERY, NODE_TYPE_IC, NODE_TYPE_LOAD
 )
 
+
+# --- [핵심] 하이브리드 보상 가중치 상수 ---
+# R_action: 즉각적인 IC 비용에 대한 가중치 (0.0으로 설정 시 순수 R_path)
+REWARD_WEIGHT_ACTION = 0
+# R_path: 경로 완성 시 누적 비용(staging_cost)에 대한 가중치
+REWARD_WEIGHT_PATH = 1.0
+# 스텝 페널티: 경로를 불필요하게 길게 만드는 것을 방지
+STEP_PENALTY = 0
+# R_fail: 실패 시 페널티
+FAILURE_PENALTY = -100.0
+
+
 BATTERY_NODE_IDX = 0
 
 class PocatEnv(EnvBase):
@@ -65,6 +77,7 @@ class PocatEnv(EnvBase):
             "step_count": UnboundedDiscrete(shape=(1,)),
             # --- 👇 [여기에 새로운 상태 명세를 추가합니다] ---
             "current_cost": Unbounded(shape=(1,)),
+            "staging_cost": Unbounded(shape=(1,)), # *현재 구축 중인* 경로의 누적 비용
             "is_used_ic_mask": Unbounded(shape=(num_nodes,), dtype=torch.bool),
             "current_target_load": UnboundedDiscrete(shape=(1,)),
         })
@@ -184,6 +197,7 @@ class PocatEnv(EnvBase):
             "step_count": torch.zeros(batch_size, 1, dtype=torch.long, device=self.device),
             # --- 👇 [여기에 새로운 상태 초기값을 추가합니다] ---
             "current_cost": torch.zeros(batch_size, 1, dtype=torch.float32, device=self.device),
+            "staging_cost": torch.zeros(batch_size, 1, dtype=torch.float32, device=self.device), #
             "is_used_ic_mask": torch.zeros(batch_size, num_nodes, dtype=torch.bool, device=self.device),
             "current_target_load": torch.full((batch_size, 1), -1, dtype=torch.long, device=self.device),
         }, batch_size=[batch_size], device=self.device)
@@ -233,10 +247,15 @@ class PocatEnv(EnvBase):
         next_obs["adj_matrix"] = td["adj_matrix"].clone()
         next_obs["is_used_ic_mask"] = td["is_used_ic_mask"].clone()
         next_obs["current_target_load"] = td["current_target_load"].clone()
-
+        # ---  staging_cost 복제 및 스텝 리워드 초기화 ---
+        next_obs["current_cost"] = td["current_cost"].clone()
+        next_obs["staging_cost"] = td["staging_cost"].clone()
+        # 기본 보상: 작은 스텝 페널티 (경로를 짧게 만들도록 유도)
+        step_reward = torch.full((batch_size,), STEP_PENALTY, dtype=torch.float32, device=self.device)
+        # --- 수정 완료 ---
         batch_indices = torch.arange(batch_size, device=self.device)
 
-        # 1. 액션 타입에 따라 상태 업데이트
+        # 1. 액션 타입: [Select New Load]
         head_is_battery = current_head == BATTERY_NODE_IDX
         if head_is_battery.any():
             # [Select New Load]
@@ -245,8 +264,11 @@ class PocatEnv(EnvBase):
             next_obs["trajectory_head"][battery_rows, 0] = selected_load
             next_obs["unconnected_loads_mask"][battery_rows, selected_load] = False
             next_obs["current_target_load"][battery_rows, 0] = selected_load
+            # --- 👇 [핵심 수정 2] 새 경로 시작, staging_cost 리셋 ---
+            next_obs["staging_cost"][battery_rows] = 0.0
+            # (이 스텝의 보상은 STEP_PENALTY만 적용됨)
 
-
+        # 2. 액션 타입: [Find Parent]
         head_is_node = ~head_is_battery
         if head_is_node.any():
             # [Find Parent]
@@ -264,7 +286,7 @@ class PocatEnv(EnvBase):
                 next_obs["is_used_ic_mask"][ic_rows, ic_indices] = True
 
 
-            # 4. 다음 헤드 결정 및 작업 목표 초기화
+            # 4. 다음 헤드 결정 (비용 계산 후 수행)
             parent_is_battery = (parent_node == BATTERY_NODE_IDX)
             next_obs["trajectory_head"][node_rows, 0] = torch.where(parent_is_battery, BATTERY_NODE_IDX, parent_node)
             if parent_is_battery.any():
@@ -322,7 +344,42 @@ class PocatEnv(EnvBase):
         next_obs["nodes"][..., FEATURE_INDEX["junction_temp"]] = new_temp
         
         node_costs = next_obs["nodes"][:, :, FEATURE_INDEX["cost"]]
-        next_obs["current_cost"] = (next_obs["is_used_ic_mask"].float() * node_costs).sum(dim=1, keepdim=True)
+        # 이번 스텝으로 인해 *전체 비용*이 증가한 양
+        previous_total_cost = (td["is_used_ic_mask"].float() * node_costs).sum(dim=1, keepdim=True)
+        new_total_cost = (next_obs["is_used_ic_mask"].float() * node_costs).sum(dim=1, keepdim=True)
+        total_cost_increase = new_total_cost - previous_total_cost # (B, 1)
+
+        # [Find Parent] 모드였던 인스턴스에 대해서만 R_action, R_path 적용
+        if head_is_node.any():
+            # 3a. [공통] staging_cost에 비용 증가분을 누적
+            next_obs["staging_cost"][node_rows] += total_cost_increase[node_rows]
+
+            # 3b. R_action (액션별 비용) 보상을 스텝 보상에 추가
+            #    (total_cost_increase는 (B,1) -> (B_act,)로 변환)
+            step_reward[node_rows] += REWARD_WEIGHT_ACTION * (-total_cost_increase[node_rows].squeeze(-1))
+
+            # 3c. R_path (경로별 비용) 보상
+            finished_rows = node_rows[parent_is_battery]
+            if finished_rows.numel() > 0:
+                next_obs["trajectory_head"][finished_rows, 0] = BATTERY_NODE_IDX
+                next_obs["current_target_load"][finished_rows, 0] = -1
+
+                # 경로 완성 시, 누적된 staging_cost를 R_path 보상으로 추가
+                sub_trajectory_total_cost = next_obs["staging_cost"][finished_rows]
+                step_reward[finished_rows] += REWARD_WEIGHT_PATH * (-sub_trajectory_total_cost.squeeze(-1))
+
+                # staging_cost를 0으로 리셋하고, current_cost(최종비용)에 반영
+                next_obs["current_cost"][finished_rows] += sub_trajectory_total_cost
+                next_obs["staging_cost"][finished_rows] = 0.0
+
+            # 3d. 경로가 진행 중인 인스턴스
+            in_progress_rows = node_rows[~parent_is_battery]
+            if in_progress_rows.numel() > 0:
+                next_obs["trajectory_head"][in_progress_rows, 0] = parent_node[~parent_is_battery]
+                # (보상은 이미 STEP_PENALTY + R_action 으로 설정됨)
+        # --- 수정 완료 ---
+
+
         next_obs.set("step_count", td["step_count"] + 1)
 
 
@@ -339,7 +396,14 @@ class PocatEnv(EnvBase):
         
         return TensorDict({
             "next": next_obs,
-            "reward": self.get_reward(next_obs, done_successfully, timed_out, is_stuck_or_finished),
+            # --- 👇 [핵심 수정 4] get_reward로 스텝 리워드 전달 ---
+            "reward": self.get_reward(
+                next_obs,
+                step_reward, # (B,) 텐서 (STEP_PENALTY + R_action + R_path)
+                done_successfully,
+                timed_out,
+                is_stuck_or_finished
+            ),
             "done": next_obs["done"],
         }, batch_size=batch_size)
         
@@ -537,25 +601,27 @@ class PocatEnv(EnvBase):
 
 
     
-    def get_reward(self, td: TensorDict, done_successfully: torch.Tensor, timed_out: torch.Tensor, is_stuck_or_finished: torch.Tensor) -> torch.Tensor:
-        """
-        보상을 계산합니다. 성공, 타임아웃, 갇힘 상태에 따라 다른 보상을 부여합니다.
-        """
-        batch_size = td.batch_size[0]
-        reward = torch.zeros(batch_size, device=self.device)
+    # --- 👇 [핵심 5] get_reward 함수 시그니처 및 로직 변경 ---
+    def get_reward(self,
+                   td: TensorDict,
+                   step_reward: torch.Tensor, # _step에서 계산된 기본 보상
+                   done_successfully: torch.Tensor,
+                   timed_out: torch.Tensor,
+                   is_stuck_or_finished: torch.Tensor) -> torch.Tensor:
         
-        # 1. 성공적으로 완료된 경우: 비용 기반으로 기본 보상 계산
-        if done_successfully.any():
-            is_used_mask = td["adj_matrix"][done_successfully].any(dim=2)
-            node_costs = td["nodes"][done_successfully, :, FEATURE_INDEX["cost"]]
-            ic_mask = td["nodes"][done_successfully, :, FEATURE_INDEX["node_type"][0] + NODE_TYPE_IC] == 1
-            used_ic_mask = is_used_mask & ic_mask
-            total_cost = (node_costs * used_ic_mask).sum(dim=-1)
-            reward[done_successfully] = -total_cost
 
-        # 3. 중간에 갇히거나 타임아웃으로 실패한 경우: 큰 페널티
+        """
+        보상을 계산합니다.
+        - 기본 보상 (Dense/Intermediate): _step에서 계산된 값 (스텝 페널티 + R_action + R_path)
+        - 최종 보상 (Sparse): *실패* 페널티만 적용
+        """
+
+        reward = step_reward.clone()
+
+        # R_fail (실패 페널티)
+        # 실패 시, 이전까지의 보상을 모두 덮어쓰고 강력한 페널티를 부여
+
         failed = (timed_out | is_stuck_or_finished) & ~done_successfully
         if failed.any():
-            reward[failed] -= 100.0 # 예시 패널티 값
-            
+            reward[failed] = FAILURE_PENALTY            
         return reward
