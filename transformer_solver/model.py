@@ -258,6 +258,12 @@ class PocatDecoder(nn.Module):
         # 상태 벡터 차원: 3 (avg_current, unconnected_ratio, step_ratio)
         self.Wq_context = nn.Linear(embedding_dim + 3, head_num * qkv_dim, bias=False)
         self.multi_head_combine = nn.Linear(head_num * qkv_dim, embedding_dim)
+        # --- 👇 [A2C] Critic Value Head 추가 ---
+        self.value_head = nn.Sequential(
+            nn.Linear(embedding_dim, embedding_dim // 2),
+            nn.ReLU(),
+            nn.Linear(embedding_dim // 2, 1) # (B, 1, 1) -> (B, 1)
+        )
 
     def forward(self, td: TensorDict, cache: PrecomputedCache):
         # 동적 상태 피처 생성
@@ -278,7 +284,10 @@ class PocatDecoder(nn.Module):
         mha_out = multi_head_attention(q, cache.glimpse_key, cache.glimpse_val)
         mh_atten_out = self.multi_head_combine(mha_out)
         scores = torch.matmul(mh_atten_out, cache.logit_key).squeeze(1) / (self.embedding_dim ** 0.5)
-        return scores, None # A2C와 호환성을 위해 None을 반환 (REINFORCE에서는 사용 안 함)
+        # --- 👇 [A2C] mh_atten_out (컨텍스트)를 Critic Head에 통과 ---
+        value = self.value_head(mh_atten_out).squeeze(-1) # (B, 1, 1) -> (B, 1)
+
+        return scores, value
 
 
 class PocatModel(nn.Module):
@@ -338,6 +347,8 @@ class PocatModel(nn.Module):
         # --- 👇 [핵심 1] 스텝별 Reward도 수집 ---
         log_probs, actions = [], []
         rewards = []
+        # --- 👇 [A2C] 첫 스텝의 Value를 저장할 변수 ---
+        first_value = None
         # 첫 번째 'action' (POMO 시작 노드 설정)은 보상이나 log_prob이 없으므로
         # actions 리스트에만 추가합니다.
         actions.append(action)
@@ -346,8 +357,13 @@ class PocatModel(nn.Module):
         decoding_step = 0
         while not td["done"].all():
             decoding_step += 1
+            # --- 👇 [A2C] scores와 value를 함께 받음 ---
+            scores, value = self.decoder(td, cache)
             
-            scores, _ = self.decoder(td, cache)
+            # POMO 시작 노드 선택 직후(첫 디코딩 스텝)의 Value만 저장
+            if decoding_step == 1:
+                first_value = value.squeeze(-1) # (B, 1) -> (B)
+            
             # tanh 함수를 이용해 score를 -1과 1 사이로 압축하고,
             # clipping 값(10)을 곱해 최종 score가 -10과 10 사이를 넘지 않도록 제한합니다.
             scores = self.logit_clipping * torch.tanh(scores)
@@ -507,5 +523,6 @@ class PocatModel(nn.Module):
         return {
             "reward": torch.stack(rewards, 1).sum(1), # [B_total, T] -> [B_total]
             "log_likelihood": torch.stack(log_probs, 1).sum(1),
-            "actions": torch.stack(actions, 1) # [B_total, T+1] (첫 액션 포함)
+            "actions": torch.stack(actions, 1), # [B_total, T+1] (첫 액션 포함)
+            "value": first_value # --- 👆 [A2C] 첫 스텝의 Value 반환 ---
         }

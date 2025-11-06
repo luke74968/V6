@@ -1,6 +1,7 @@
 # transformer_solver/trainer.py
 import torch
 from tqdm import tqdm
+import torch.nn.functional as F # 👈 F.mse_loss를 위해 추가
 import os
 import time # 💡 시간 측정을 위해 time 모듈 추가
 from datetime import datetime
@@ -139,10 +140,22 @@ class PocatTrainer:
                 bwd_start_time = time.time()
                 num_starts = self.env.generator.num_loads
                 reward = out["reward"].view(-1, num_starts)
-                log_likelihood = out["log_likelihood"].view(-1, num_starts)
-                
-                advantage = reward - reward.mean()  # 💡 전체 평균을 baseline으로 사용
-                loss = -(advantage * log_likelihood).mean()
+                # --- 👇 [A2C] Loss 계산 로직 변경 ---
+                log_likelihood = out["log_likelihood"].view(-1, num_starts) # (B, N_pomo)
+                value = out["value"].view(-1, num_starts) # (B, N_pomo)
+
+                # 1. Critic Loss (Value Head가 실제 총 보상 G를 예측하도록 학습)
+                # (value는 V(s_1)을, reward는 G_1을 의미)
+                critic_loss = F.mse_loss(value, reward)
+
+                # 2. Policy Loss (Actor)
+                # Baseline으로 reward.mean() 대신 critic의 value를 사용
+                advantage = reward - value.detach() # .detach()로 Critic망에 그래디언트 전파 차단
+                policy_loss = -(advantage * log_likelihood).mean()
+
+                # 3. Total Loss (Actor Loss + Critic Loss)
+                loss = policy_loss + 0.5 * critic_loss # 0.5는 critic loss 가중치
+                # --- 👆 [A2C] 수정 완료 ---
                 loss.backward()
                 
                 # 그래디언트 클리핑 (옵션)
