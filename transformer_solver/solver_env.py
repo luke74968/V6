@@ -450,7 +450,7 @@ class PocatEnv(EnvBase):
 
             # 조건 0a: 부모는 Load 타입이 아니어야 함
             not_load_parent = self.node_type_tensor.unsqueeze(0) != NODE_TYPE_LOAD
-
+            not_load_parent = not_load_parent.expand(B_act, -1)
             # 조건 0b: 자기 자신은 부모가 될 수 없음
             not_self_parent = self.arange_nodes.unsqueeze(0) != child_nodes.unsqueeze(1)
 
