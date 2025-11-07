@@ -115,6 +115,8 @@ class PocatTrainer:
             
             total_loss = 0.0
             total_cost = 0.0
+            total_policy_loss = 0.0 # 👈 [A2C 로깅] P_loss 누적 변수
+            total_critic_loss = 0.0 # 👈 [A2C 로깅] V_loss 누적 변수
             min_epoch_cost = float('inf') # 💡 **[변경 1]** 에포크 내 최소 비용을 기록할 변수 추가
 
             for step in range(1, total_steps + 1):
@@ -196,7 +198,8 @@ class PocatTrainer:
 
                 total_loss += loss.item()
                 total_cost += avg_cost
-                
+                total_policy_loss += policy_loss.item()
+                total_critic_loss += critic_loss.item()
                 update_progress(
                     train_pbar,
                     {
@@ -211,8 +214,9 @@ class PocatTrainer:
 
             epoch_summary = (
                 f"Epoch {epoch}/{args.trainer_params['epochs']} | "
-                f"Loss {total_loss / total_steps:.4f} | "
-                f"Avg Cost ${total_cost / total_steps:.2f} | "
+                f"Total Loss {total_loss / total_steps:.4f} | "
+                f"P_Loss {total_policy_loss / total_steps:.4f} | "
+                f"V_Loss {total_critic_loss / total_steps:.4f} | "
                 f"Min Cost ${min_epoch_cost:.2f}"
             )
             tqdm.write(epoch_summary)
@@ -226,6 +230,7 @@ class PocatTrainer:
             if (epoch % args.trainer_params['model_save_interval'] == 0) or (epoch == args.trainer_params['epochs']):
                 save_path = os.path.join(args.result_dir, f'epoch-{epoch}.pth')
                 args.log(f"Saving model at epoch {epoch} to {save_path}")
+                self._run_test_visualization(epoch, is_best=False)
                 torch.save({
                     'epoch': epoch,
                     'model_state_dict': self.model.state_dict(),
@@ -282,6 +287,9 @@ class PocatTrainer:
                 'model_state_dict': self.model.state_dict(),
                 'optimizer_state_dict': self.optimizer.state_dict(),
             }, save_path)
+            # --- 👇 [요청 2] Best 모델 저장 시 테스트 시각화 실행 ---
+            self.args.log(f"[Eval] ✅ Running test visualization for new best model...")
+            self._run_test_visualization(epoch, is_best=True)
             self.args.log(f"[Eval] ✅ New best avg_bom=${avg_bom:.2f} (min=${min_bom:.2f}) at epoch {epoch} → saved {save_path}")
 
         return {"avg_bom": avg_bom, "min_bom": min_bom}
@@ -289,6 +297,33 @@ class PocatTrainer:
     def test(self):
         self.model.eval()
         logging.info("==================== INFERENCE START ====================")
+
+        # --- 👇 [핵심] _run_test_visualization 호출 ---
+        # test_only 모드일 때는 에포크 번호가 없으므로 0으로 설정, best도 아님
+        self._run_test_visualization(epoch=0, is_best=False)
+
+
+    @torch.no_grad()
+    def _run_test_visualization(self, epoch: int, is_best: bool = False):
+        """
+        테스트 모드와 동일한 로직으로 단일 인스턴스에 대한 추론을 실행하고
+        파워트리 시각화(PNG)를 저장합니다.
+        (기존 test 메소드의 로직을 이 함수로 이동)
+        """
+        self.model.eval()
+
+        if is_best:
+            log_prefix = f"[Test Viz @ Epoch {epoch} (BEST)]"
+            filename_prefix = f"epoch_{epoch}_best"
+        elif epoch > 0: # 5 에포크 간격 저장
+            log_prefix = f"[Test Viz @ Epoch {epoch}]"
+            filename_prefix = f"epoch_{epoch}"
+        else: # --test_only로 직접 실행
+            log_prefix = "[Test Viz (Standalone)]"
+            filename_prefix = "test_solution"
+
+        self.args.log(f"{log_prefix} Running inference to generate power tree...")
+
 
         # --- 👇 [핵심 수정 5] 테스트 시 데이터 확장 및 결과 처리 ---
         test_samples = self.args.test_num_pomo_samples
@@ -298,7 +333,7 @@ class PocatTrainer:
         
         pbar = tqdm(total=1, desc=f"Solving Power Tree (Mode: {self.args.decode_type}, Samples: {test_samples})")
         out = self.model(td, self.env, decode_type=self.args.decode_type, pbar=pbar, 
-                         log_fn=logging.info, log_idx=self.args.log_idx, 
+                         log_fn=self.args.log, log_idx=self.args.log_idx,
                          log_mode=self.args.log_mode)
         pbar.close()
 
@@ -344,10 +379,13 @@ class PocatTrainer:
 
         # --- 👇 [핵심 수정 3] 시각화 함수에 시작 노드 이름 전달 ---
         self.visualize_result(action_history, final_cost, best_start_node_name, td_sim)
-
+        # --- 👇 [핵심 수정] 시각화 함수에 새 filename_prefix 전달 ---
+        self.visualize_result(action_history, final_cost, best_start_node_name, td_sim, filename_prefix=filename_prefix)
+        self.args.log(f"{log_prefix} Power tree visualization saved.")
 
     # 💡 [핵심 수정] visualize_result 메서드를 OR-Tools 수준으로 대폭 업그레이드
-    def visualize_result(self, action_history, final_cost, best_start_node_name, final_td):
+    def visualize_result(self, action_history, final_cost, best_start_node_name, final_td, filename_prefix: str = "solution"):
+        if self.result_dir is None: return
         if self.result_dir is None: return
         os.makedirs(self.result_dir, exist_ok=True)
 
@@ -542,7 +580,7 @@ class PocatTrainer:
                 dot.edge(p_name, c_name)
         
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"transformer_solution_cost_{final_cost:.4f}_{timestamp}"
+        filename = f"{filename_prefix}_cost_{final_cost:.4f}_{timestamp}"
         output_path = os.path.join(self.result_dir, filename)
         
         try:

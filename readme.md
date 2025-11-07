@@ -34,16 +34,17 @@ python3 -m transformer_solver.run --config_file configs/config_6.json --config_y
 # 예시 2 (진행률)
 python3 -m transformer_solver.run --config_file configs/config_6.json --config_yaml configs/config.yaml --batch_size 256 --log_idx 8 --log_mode progress --decode_type sampling
 # 예시 3 (POMO 샘플링)
-python3 -m transformer_solver.run --config_file configs/config_6.json --config_yaml configs/config.yaml --batch_size 2 --log_idx 0 --log_mode progress --decode_type sampling --num_pomo_samples 48
+python3 -m transformer_solver.run --config_file configs/config_6.json --config_yaml configs/config.yaml --batch_size 3 --log_idx 0 --log_mode progress --decode_type sampling --num_pomo_samples 48
 # 예시 4 (batch size 1 , single pomo)
 python3 -m transformer_solver.run --config_file configs/config_6.json --config_yaml configs/config.yaml --batch_size 1 --log_idx 0 --log_mode detail --decode_type sampling --num_pomo_samples 1
+
 
 # 학습된 결과로 Tronsformer based solver test 실행
 
 # 예시 1 
 python3 -m transformer_solver.run --test_only --config_file configs/config_4.json --log_mode detail --log_idx 0 --load_path "transformer_solver/result/2025-0923-174528/epoch-5.pth"
 # 예시 2 (best_cost.pth 사용)
-python3 -m transformer_solver.run --test_only --config_file configs/config_6.json --log_mode detail --log_idx 0 --load_path "transformer_solver/result/2025-1013-133337/best_cost.pth"
+python3 -m transformer_solver.run --test_only --config_file configs/config_6.json --config_yaml configs/config.yaml --log_mode detail --log_idx 0 --load_path "transformer_solver/result/2025-1013-133337/best_cost.pth"
 
 
 # 디버그 모드 

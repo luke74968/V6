@@ -22,7 +22,8 @@ REWARD_WEIGHT_PATH = 1.0
 STEP_PENALTY = 0
 # R_fail: 실패 시 페널티
 FAILURE_PENALTY = -100.0
-
+# 👈 [암전류] 초과된 암전류 1A당 페널티 (음수 보상) 크기
+PENALTY_WEIGHT_SLEEP = 1000.0 # 예: 1mA(0.001A) 초과 시 -10.0의 페널티
 
 BATTERY_NODE_IDX = 0
 
@@ -51,16 +52,16 @@ class PocatEnv(EnvBase):
             self.arange_nodes = torch.arange(num_nodes, device=self.device)
         
         # node_type_tensor는 config에서 오므로 고정, __init__에서 한 번만 생성되도록 수정
-        if self.node_type_tensor is None:
+        if (self.node_type_tensor is None) or (self.node_type_tensor.numel() != num_nodes):
             node_types_list = [self.generator.config.node_types[i] for i in range(num_nodes)]
             self.node_type_tensor = torch.tensor(node_types_list, dtype=torch.long, device=self.device)
 
         # rail_types도 config에서 오므로 고정
-        if self.rail_types is None:
+        if (self.rail_types is None) or (self.rail_types.numel() != self.generator.num_loads):
             rail_type_map = {"exclusive_supplier": 1, "exclusive_path": 2}
             load_configs = self.generator.config.loads
             rail_types_list = [rail_type_map.get(cfg.get("independent_rail_type"), 0) for cfg in load_configs]
-            self.rail_types = torch.tensor(rail_types_list, dtype=torch.long, device=self.device)
+            self.rail_types = torch.tensor(rail_types_list, dtype=torch.long, device=self.device) if rail_types_list else torch.tensor([], dtype=torch.long, device=self.device)
 
     def _make_spec(self):
         """환경의 observation, action, reward 스펙을 정의합니다."""
@@ -80,6 +81,7 @@ class PocatEnv(EnvBase):
             "staging_cost": Unbounded(shape=(1,)), # *현재 구축 중인* 경로의 누적 비용
             "is_used_ic_mask": Unbounded(shape=(num_nodes,), dtype=torch.bool),
             "current_target_load": UnboundedDiscrete(shape=(1,)),
+            "is_exclusive_mask": Unbounded(shape=(num_nodes,), dtype=torch.long), # 👈 [신규] 0: Normal, 1: Supplier, 2: Path
         })
         
         self.action_spec = UnboundedDiscrete(shape=(1,))
@@ -156,21 +158,6 @@ class PocatEnv(EnvBase):
             path_mask |= parents_mask
         return path_mask
 
-    def _propagate_exclusive_path_upward(
-        self,
-        obs: TensorDict,
-        rows: torch.Tensor,
-        parent_indices: torch.Tensor,
-        child_indices: torch.Tensor,
-    ) -> None:
-        if rows.numel() == 0:
-            return
-
-        ancestors = self._trace_path_batch(parent_indices, obs["adj_matrix"][rows])
-        obs["is_exclusive_path"][rows] |= ancestors
-        obs["is_exclusive_path"][rows, parent_indices] = True
-        obs["is_exclusive_path"][rows, child_indices] = True
-
     def _reset(self, td: Optional[TensorDict] = None, **kwargs) -> TensorDict:
         batch_size = kwargs.get("batch_size", self.batch_size)
         if td is None:
@@ -200,6 +187,7 @@ class PocatEnv(EnvBase):
             "staging_cost": torch.zeros(batch_size, 1, dtype=torch.float32, device=self.device), #
             "is_used_ic_mask": torch.zeros(batch_size, num_nodes, dtype=torch.bool, device=self.device),
             "current_target_load": torch.full((batch_size, 1), -1, dtype=torch.long, device=self.device),
+            "is_exclusive_mask": torch.zeros(batch_size, num_nodes, dtype=torch.long, device=self.device), # 👈 [신규] 0으로 초기화
         }, batch_size=[batch_size], device=self.device)
        
         # 배터리(인덱스 0)는 항상 메인 트리에 포함
@@ -207,6 +195,7 @@ class PocatEnv(EnvBase):
         is_load = node_types == NODE_TYPE_LOAD
         reset_td["unconnected_loads_mask"][:, ~is_load] = False
         reset_td.set("done", torch.zeros(batch_size, 1, dtype=torch.bool, device=self.device))
+        self._ensure_buffers(reset_td)
         return reset_td
 
     # 💡 추가된 step 메소드: 배치 크기 검사를 우회합니다.
@@ -241,6 +230,18 @@ class PocatEnv(EnvBase):
         action = td["action"].reshape(batch_size)
         current_head = td["trajectory_head"].reshape(batch_size)
 
+        # --- 👇 [핵심 버그 수정 1] ---
+        # 이미 'done' 상태인 샘플을 식별합니다. (B,)
+        is_already_done = td["done"].squeeze(-1)
+        
+        # 만약 모든 샘플이 이미 'done'이면, 즉시 0점짜리 리워드를 반환합니다.
+        if is_already_done.all():
+            return TensorDict({
+                "next": td, 
+                "reward": torch.zeros(batch_size, device=self.device), 
+                "done": td["done"]}, batch_size=td.batch_size)
+        # --- 수정 완료 ---
+
         # 💡 [핵심 수정] 얕은 복사 대신, 수정될 텐서만 깊은 복사(deep copy)
         next_obs = td.clone() # 껍데기는 얕은 복사
         next_obs["nodes"] = td["nodes"].clone()
@@ -260,13 +261,29 @@ class PocatEnv(EnvBase):
         if head_is_battery.any():
             # [Select New Load]
             battery_rows = batch_indices[head_is_battery]
-            selected_load = action[head_is_battery]
-            next_obs["trajectory_head"][battery_rows, 0] = selected_load
-            next_obs["unconnected_loads_mask"][battery_rows, selected_load] = False
-            next_obs["current_target_load"][battery_rows, 0] = selected_load
-            # --- 👇 [핵심 수정 2] 새 경로 시작, staging_cost 리셋 ---
-            next_obs["staging_cost"][battery_rows] = 0.0
+            action_from_battery = action[head_is_battery]
+
+            # --- 👇 [핵심 버그 수정] ---
+            # 액션이 실제 '로드'인 경우와 '배터리(0)'(종료)인 경우를 분리
+            is_load_selection = (action_from_battery != BATTERY_NODE_IDX)
+            if is_load_selection.any():
+                load_rows = battery_rows[is_load_selection]
+                selected_load = action_from_battery[is_load_selection]
+
+                next_obs["trajectory_head"][load_rows, 0] = selected_load
+                next_obs["unconnected_loads_mask"][load_rows, selected_load] = False
+                next_obs["current_target_load"][load_rows, 0] = selected_load
+                next_obs["staging_cost"][load_rows] = 0.0
+                
+                # '표기' 시작: 로드의 독립 조건을 is_exclusive_mask에 기록
+                load_start_idx = 1 + self.generator.num_ics
+                load_indices_in_config = selected_load - load_start_idx
+                rail_types_to_set = self.rail_types[load_indices_in_config]
+                next_obs["is_exclusive_mask"][load_rows, selected_load] = rail_types_to_set
+
             # (이 스텝의 보상은 STEP_PENALTY만 적용됨)
+
+            # (액션이 0번(배터리)인 경우는 아무 작업도 하지 않고 'Find Parent'로 넘어감)
 
         # 2. 액션 타입: [Find Parent]
         head_is_node = ~head_is_battery
@@ -279,6 +296,22 @@ class PocatEnv(EnvBase):
             # 2. 연결 정보 및 사용 여부 업데이트
             next_obs["adj_matrix"][node_rows, parent_node, child_node] = True
             node_types = td["nodes"][0, :, FEATURE_INDEX["node_type"][0]:FEATURE_INDEX["node_type"][1]].argmax(-1)
+            # --- 👇 [핵심 수정 3 & Point 1, 3 Fix] '표기' 전파: 자식의 독립 조건을 부모가 물려받음 ---
+            # (B_act,)
+            child_status = next_obs["is_exclusive_mask"][node_rows, child_node]
+            # 'child_status'가 0 (Normal)이 아닌 경우에만 '표기' 로직 실행
+            if (child_status > 0).any():
+                parent_status = next_obs["is_exclusive_mask"][node_rows, parent_node]
+
+                # [Point 1, 5 Fix] dtype을 child_status.dtype (long)으로 통일
+                zero_tensor = torch.tensor(0, device=self.device, dtype=child_status.dtype)
+                # 'Path(2)'만 상위로 전파됨.
+                status_to_propagate = torch.where(child_status == 2, child_status, zero_tensor)
+                # 부모는 (1)자신의 상태, (2)전파된 Path, (3)자식의 Supplier(1) 상태 중 가장 높은 값을 가짐.
+                status_from_child = torch.where(child_status == 1, child_status, status_to_propagate)
+                new_parent_status = torch.max(parent_status, status_from_child)
+                next_obs["is_exclusive_mask"][node_rows, parent_node] = new_parent_status
+            # --- '표기' 전파 완료 ---
             is_parent_ic = (node_types[parent_node] == NODE_TYPE_IC)
             if is_parent_ic.any():
                 ic_rows = node_rows[is_parent_ic]
@@ -296,8 +329,8 @@ class PocatEnv(EnvBase):
         # 5. 전류, 온도, 비용 업데이트
         # 1. 초기 전류 수요는 Load의 active_current로 설정
         current_demands = next_obs["nodes"][..., FEATURE_INDEX["current_active"]].clone()
-        ic_mask = next_obs["nodes"][0, :, FEATURE_INDEX["node_type"][0] + NODE_TYPE_IC] == 1.0
-        current_demands[:, ic_mask] = 0.0
+        ic_mask_b_n = (next_obs["nodes"][..., FEATURE_INDEX["node_type"][0] + NODE_TYPE_IC] == 1.0)
+        current_demands[ic_mask_b_n] = 0.0 # (B, N) 마스크를 (B, N) 텐서에 직접 적용
         
         adj_matrix_T = next_obs["adj_matrix"].float().transpose(-1, -2)
 
@@ -394,20 +427,28 @@ class PocatEnv(EnvBase):
         is_done = done_successfully | timed_out | is_stuck_or_finished
         next_obs["done"] = is_done.unsqueeze(-1)
         
+        # --- 👇 [핵심 버그 수정 1] get_reward 호출 및 상태 덮어쓰기 ---
+        final_reward = self.get_reward(
+            next_obs,
+            step_reward, # (B,) 텐서 (STEP_PENALTY + R_action + R_path)
+            done_successfully,
+            timed_out,
+            is_stuck_or_finished
+        )
+        
+        # 이미 'done'이었던 샘플들은 보상을 0으로 강제하고, 상태를 덮어쓰지 않습니다.
+        if is_already_done.any():
+            final_reward[is_already_done] = 0.0
+            next_obs[is_already_done] = td[is_already_done]
+        # --- 수정 완료 ---
+
         return TensorDict({
             "next": next_obs,
-            # --- 👇 [핵심 수정 4] get_reward로 스텝 리워드 전달 ---
-            "reward": self.get_reward(
-                next_obs,
-                step_reward, # (B,) 텐서 (STEP_PENALTY + R_action + R_path)
-                done_successfully,
-                timed_out,
-                is_stuck_or_finished
-            ),
-            "done": next_obs["done"],
+            "reward": final_reward.unsqueeze(-1),
+            "done": next_obs["done"], # 'is_already_done' 샘플도 'done=True'로 유지됨
         }, batch_size=batch_size)
         
-    # 💡 *** 여기가 핵심 수정 부분입니다 ***
+# 💡 *** 여기가 핵심 수정 부분입니다 (get_action_mask) ***
     def get_action_mask(self, td: TensorDict, debug: bool = False) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
         self._ensure_buffers(td) # 맨 앞에서 버퍼 동기화
         
@@ -415,13 +456,7 @@ class PocatEnv(EnvBase):
         mask = torch.zeros(batch_size, num_nodes, dtype=torch.bool, device=self.device)
         current_head = td["trajectory_head"].squeeze(-1)
         
-        # 💡 [수정] debug 모드일 때 reasons 딕셔너리를 미리 초기화
-        reasons = {}
-
-        # 💡 디버깅 로그를 위한 설정
-        is_debug_instance = td.batch_size[0] > 0 and td.get("log_mode", "detail") == "detail"
-        debug_idx = td.get("log_idx", 0) if is_debug_instance else -1
-
+        reasons = {} # 디버그 이유 저장
 
         # --- 1. [Select New Load] 모드 마스킹 ---
         head_is_battery = (current_head == BATTERY_NODE_IDX)
@@ -429,111 +464,99 @@ class PocatEnv(EnvBase):
             all_has_unconnected = td["unconnected_loads_mask"].any(dim=-1)
             is_active = head_is_battery & all_has_unconnected
             is_finished = head_is_battery & ~all_has_unconnected
+            
             mask[is_active] = td["unconnected_loads_mask"][is_active]
             mask[is_finished, BATTERY_NODE_IDX] = True
-            # 💡 [수정] Select New Load 모드일 때도 reasons를 반환하도록 수정
+            
             if debug:
-                # [Select New Load] 모드의 reasons는 단순함
                 reasons = {"Unconnected Load": td["unconnected_loads_mask"]}
-                # [Find Parent] 모드의 reasons는 아래에서 생성됨
-            else: # debug=False
-                return mask
+            # (중요) head_is_battery와 head_is_node는 상호 배타적이므로,
+            # [Find Parent] 로직이 실행될 수 있도록 여기서 return하지 않습니다.
+
 
         # --- 2. [Find Parent] 모드 마스킹 (모든 조건을 한번에 계산) ---
         head_is_node = ~head_is_battery
         if head_is_node.any():
             b_idx_node = torch.where(head_is_node)[0]
             child_nodes = current_head[head_is_node]
-            B_act = len(b_idx_node)
+            node_types_tensor = self.node_type_tensor # (N,)
+            B_act = len(b_idx_node) # (B_act,)
+            
+            # --- [공통 마스크] ---
+            # (1, N_nodes) -> (B_act, N_nodes)
+            is_battery_mask = (self.arange_nodes.unsqueeze(0) == BATTERY_NODE_IDX).expand(B_act, -1)
+            # (1, N_nodes) -> (B_act, N_nodes)
+            not_load_parent = (self.node_type_tensor.unsqueeze(0) != NODE_TYPE_LOAD).expand(B_act, -1)
+            # (B_act, 1) -> (B_act, N_nodes)
+            not_self_parent = (self.arange_nodes.unsqueeze(0) != child_nodes.unsqueeze(1))
 
-            is_battery_mask = (self.arange_nodes.unsqueeze(0) == BATTERY_NODE_IDX)
-
-            # 조건 0a: 부모는 Load 타입이 아니어야 함
-            not_load_parent = self.node_type_tensor.unsqueeze(0) != NODE_TYPE_LOAD
-            not_load_parent = not_load_parent.expand(B_act, -1)
-            # 조건 0b: 자기 자신은 부모가 될 수 없음
-            not_self_parent = self.arange_nodes.unsqueeze(0) != child_nodes.unsqueeze(1)
-
-
-            # --- 👇 [핵심 수정] 모든 마스킹 조건을 개별적으로 계산 ---
-
-            # 1. 전압 호환성
-            # connectivity_matrix[batch, parent, child] -> [b_idx_node, :, child_nodes]
-            # PyTorch의 gather를 사용하여 각 배치 항목에 맞는 child 슬라이스를 선택
-            connectivity = td["connectivity_matrix"][b_idx_node]
+            
+            # --- 1. 전압 호환성 ---
+            # (B, N, N) -> (B_act, N, N)
+            connectivity = td["connectivity_matrix"][b_idx_node] 
+            # (B_act, 1, 1) -> (B_act, N, 1)
             child_indices_exp = child_nodes.view(-1, 1, 1).expand(-1, num_nodes, 1)
+            # (B_act, N)
             volt_ok = torch.gather(connectivity, 2, child_indices_exp).squeeze(-1)
 
-            # 조건 2: 사이클 방지 (_trace_path_batch는 자기 자신을 포함하므로 not_self_parent와 중복되지만, 명시적으로 둠)
+            # --- 2. 사이클 방지 ---
+            # (B_act, N)
             path_mask = self._trace_path_batch(child_nodes, td["adj_matrix"][b_idx_node])
             cycle_ok = ~path_mask
 
-            # 조건 3: 전류 한계
-            nodes_slice = td["nodes"][b_idx_node]
-            rows = torch.arange(B_act, device=self.device)
+            # --- 3. 전류 한계 ---
+            nodes_slice = td["nodes"][b_idx_node] # (B_act, N, D)
+            rows = torch.arange(B_act, device=self.device) # (B_act,)
+            # (B_act, N)
             remaining_capacity = nodes_slice[:, :, FEATURE_INDEX["i_limit"]] - nodes_slice[:, :, FEATURE_INDEX["current_out"]]
+            # (B_act,) -> (B_act, 1)
             child_current_draw = nodes_slice[rows, child_nodes, FEATURE_INDEX["current_active"]].unsqueeze(1)
+            # (B_act, N)
             current_ok = (remaining_capacity >= child_current_draw) | is_battery_mask
 
-
-            # 조건 5: Independent Rail (상황 규칙 - exclusive 경로의 경우 사용된 IC 제외)
-            target_load_idx = td["current_target_load"].squeeze(-1)[head_is_node]
+            
+            # --- 4. [버그 수정] 독립(Exclusive) 조건 ---
+            # (a) 현재 Head(child_nodes)의 상태 식별
+            # (B_act,)
+            head_status = td["is_exclusive_mask"][b_idx_node, child_nodes]
+            
+            # [Point 2 Fix] Head가 로드인지 IC인지 구별
+            # (B_act,)
+            head_is_load = (node_types_tensor[child_nodes] == NODE_TYPE_LOAD)
+            # (b) 후보 부모(Parent)의 상태 및 자식 유무 스캔
+            # (B_act, N_nodes)
+            parent_status = td["is_exclusive_mask"][b_idx_node]
+            parent_is_exclusive = (parent_status > 0)
+            
             load_start_idx = 1 + self.generator.num_ics
-            target_rail_types = torch.zeros_like(target_load_idx, dtype=torch.long)
-            valid_target_mask = (target_load_idx != -1)
-            
-            # clamp_ 대신 안전한 마스킹으로 인덱싱
-            if valid_target_mask.any():
-                config_indices = target_load_idx[valid_target_mask] - load_start_idx
-                in_range_mask = (config_indices >= 0) & (config_indices < len(self.rail_types))
-                
-                # 범위 내에 있는 유효한 인덱스에 대해서만 rail_type을 할당
-                if in_range_mask.any():
-                    final_indices = config_indices[in_range_mask]
-                    temp_types = torch.zeros_like(config_indices, dtype=torch.long)
-                    temp_types[in_range_mask] = self.rail_types[final_indices].to(self.device)
-                    target_rail_types[valid_target_mask] = temp_types
-
-            # --- 👇 [핵심 수정] 파트너님의 규칙("Exclusive는 무조건 단독 점유") 기반 로직 ---
-            # 1. 현재 타겟 로드의 타입을 확인 (target_rail_types는 위에서 계산됨)
-            is_supplier_target = (target_rail_types == 1).unsqueeze(1)
-            is_path_target = (target_rail_types == 2).unsqueeze(1)
-            is_normal_target = (target_rail_types == 0).unsqueeze(1)
-            
-            is_exclusive_target = is_supplier_target | is_path_target
-
-            # 2. 각 부모 IC가 어떤 타입의 자식을 가지고 있는지 스캔 (adj_matrix 기반)
-            # (load_start_idx는 위에서 계산됨)
             load_end_idx = load_start_idx + self.generator.num_loads
-            
-            adj_matrix_load_children = td["adj_matrix"][b_idx_node, :, load_start_idx:load_end_idx]
-            rail_types_broadcast = self.rail_types.view(1, 1, -1).expand(B_act, num_nodes, -1)
-
-            has_path_child = (adj_matrix_load_children & (rail_types_broadcast == 2)).any(dim=-1)
-            has_supplier_child = (adj_matrix_load_children & (rail_types_broadcast == 1)).any(dim=-1)
-            has_normal_child = (adj_matrix_load_children & (rail_types_broadcast == 0)).any(dim=-1)
+            # (B_act, N_nodes) - 이 부모가 'IC' 자식을 가졌는가?
             has_ic_child = td["adj_matrix"][b_idx_node, :, 1:load_start_idx].any(dim=-1)
+            # (B_act, N_nodes) - 이 부모가 'Load' 자식을 가졌는가?
+            has_load_child = td["adj_matrix"][b_idx_node, :, load_start_idx:load_end_idx].any(dim=-1)
+            # (B_act, N_nodes) - 부모가 *어떤* 자식이라도 가졌는가? (엣지의 합 > 0)
+            parent_has_any_child = has_ic_child | has_load_child
             
-            has_any_exclusive_child = has_path_child | has_supplier_child
-            is_parent_free = ~(has_any_exclusive_child | has_normal_child | has_ic_child)
-
-            # 3. 마스킹 규칙 적용
-            # 규칙 A: 타겟이 'exclusive'(path/supplier)라면, 부모는 *반드시* 비어있어야 함
-            rule_A_ok = ~(is_exclusive_target & ~is_parent_free)
-            # 규칙 B: 타겟이 'normal'이라면, 부모는 'exclusive' 자식을 *절대* 가질 수 없음
-            rule_B_ok = ~(is_normal_target & has_any_exclusive_child)
-
-            exclusive_ok = (rule_A_ok & rule_B_ok) | is_battery_mask
-            # --- 👆 [핵심 수정 완료] ---
-
-
-            # --- 모든 벡터화 가능 조건을 단 한 번의 연산으로 결합 ---
+            # (c) 님의 규칙 정의 (True = 위반)
+            # 규칙 1: Head가 'Path' (로드든 IC든) -> 부모는 자식이 없어야 함.
+            violation_Rule1 = (head_status.unsqueeze(-1) == 2) & parent_has_any_child
+            # 규칙 2: Head가 'Supplier Load' -> 부모는 자식이 없어야 함.
+            violation_Rule2 = ((head_status == 1) & head_is_load).unsqueeze(-1) & parent_has_any_child
+            # 규칙 3: Head가 'Normal' (Load/IC) 또는 'Supplier IC' -> 부모는 Exclusive이면 안 됨.
+            violation_Rule3 = ((head_status == 0) | ((head_status == 1) & ~head_is_load)).unsqueeze(-1) & parent_is_exclusive
+            # (d) 위반 사항들을 종합 (True = 금지)
+            violations = violation_Rule1 | violation_Rule2 | violation_Rule3
+            
+            # (e) 규칙 4 (Battery)는 항상 허용
+            exclusive_ok = torch.logical_not(violations) | is_battery_mask
+            # --- [버그 수정 완료] ---
+            # --- 5. 최종 결합 ---
             can_be_parent = (
                 not_load_parent & not_self_parent & volt_ok & cycle_ok & 
                 current_ok & exclusive_ok 
             )
 
-            # --- 2-2. 루프가 필요한 Power Sequence만 따로 처리 ---
+            # --- 6. Power Sequence (루프 필요) ---
             for j_idx, k_idx, f_flag in self.power_sequences:
                 # Case 1: 현재 child가 'k'일 때 (k의 부모를 찾는 중)
                 is_k_mask = (child_nodes == k_idx)
@@ -577,31 +600,99 @@ class PocatEnv(EnvBase):
                             same_parent_mask = (self.arange_nodes == parent_of_k_idx.unsqueeze(1))
                             can_be_parent[inst_constr] &= ~same_parent_mask
 
+            # 최종 마스크를 전체 배치 마스크에 적용
             mask[head_is_node] = can_be_parent
 
-
-            
-        if debug:
-            if not head_is_node.any():
-                # [Select New Load] 모드였다면, 위에서 생성된 reasons 반환
-                return {"mask": mask, "reasons": reasons}
-
-            reasons.update({ # [Find Parent] 모드 이유를 덮어쓰기
+            if debug:
+                # [Find Parent] 모드 이유를 덮어쓰기
+                reasons.update({ 
                      "Not Load": not_load_parent,
-                     "Not Self": not_self_parent, # 💡 [복원] 디버깅 테이블에 필수적인 키
+                     "Not Self": not_self_parent,
                      "Volt OK": volt_ok,
                      "Cycle OK": cycle_ok,
                      "Current OK": current_ok,
-                     "Exclusive OK": exclusive_ok,
+                     "Exclusive OK": exclusive_ok, # 수정된 최종 로직
                      "Sequence OK": can_be_parent # Power Sequence까지 적용된 최종본
                  })
+
+        # --- 3. 최종 반환 ---
+        if debug:
             return {"mask": mask, "reasons": reasons}
             
         return mask # 디버그 모드가 아닐 때
+    # 👈 [암전류] 헬퍼 함수 (OR-Tools 로직 기반)
+    def _calculate_total_sleep_current(self, td: TensorDict) -> torch.Tensor:
+        """
+        성공한 샘플들(td)의 최종 암전류 합계를 계산합니다.
+        """
+        batch_size, num_nodes, _ = td["nodes"].shape
+        adj_matrix = td["adj_matrix"].float()
+        adj_matrix_T = adj_matrix.transpose(-1, -2) # (c, p)
+
+        # 1. "Always-On" 상태를 배터리까지 전파 (B, N)
+        always_on_loads = (td["nodes"][..., FEATURE_INDEX["always_on_in_sleep"]] == 1.0)
+        always_on_nodes = always_on_loads.clone()
+        always_on_nodes[:, BATTERY_NODE_IDX] = True # 배터리는 항상 AO
+        
+        for _ in range(num_nodes):
+            # (B,N,N) @ (B,N,1) -> (B,N,1) -> (B,N)
+            parents_mask = (adj_matrix_T @ always_on_nodes.float().unsqueeze(-1)).squeeze(-1).bool()
+            if (parents_mask & ~always_on_nodes).sum() == 0: break
+            always_on_nodes |= parents_mask
+        
+        # 2. IC 자체 암전류 소모 계산 (B, N)
+        is_ao = always_on_nodes
+        is_used = td["is_used_ic_mask"]
+        # (B,N,N) @ (B,N,1) -> (B,N) : 내 부모(p)가 AO(is_ao)인가?
+        parent_is_ao = (adj_matrix_T @ is_ao.float().unsqueeze(-1)).squeeze(-1).bool()
+
+        op_current = td["nodes"][..., FEATURE_INDEX["op_current"]]
+        quiescent_current = td["nodes"][..., FEATURE_INDEX["quiescent_current"]]
+        shutdown_current = td["nodes"][..., FEATURE_INDEX["shutdown_current"]]
+        
+        # shutdown_current가 0(미정의)이면 quiescent_current 사용
+        use_ishut_current = torch.where(shutdown_current > 1e-9, shutdown_current, quiescent_current)
+
+        ic_self_sleep = torch.zeros(batch_size, num_nodes, device=self.device)
+        
+        # 규칙 1: IC가 AO 경로상에 있음 -> Iop 소모
+        ic_self_sleep[is_ao & is_used] = op_current[is_ao & is_used]
+        # 규칙 2: IC가 AO가 아니지만, 부모가 AO -> I_shut/Iq 소모
+        ic_self_sleep[~is_ao & is_used & parent_is_ao] = use_ishut_current[~is_ao & is_used & parent_is_ao]
+        # 규칙 3: 그 외 (부모도 AO 아님) -> 0 소모
+
+        # 3. 로드 암전류 소모 계산 (B, N)
+        # 원본 td["nodes"]가 오염되지 않도록 .clone() 사용
+        load_sleep_draw_base = td["nodes"][..., FEATURE_INDEX["current_sleep"]].clone()
+        load_sleep_draw = load_sleep_draw_base * always_on_nodes.float()
+        # AO 경로가 아닌 로드는 전류 0
+        load_sleep_draw[~always_on_nodes] = 0.0
+
+        # 4. 전류 수요 전파 (LDO 방식: I_in = I_out + I_self)
+        current_demands_sleep = load_sleep_draw + ic_self_sleep
+        ic_mask = (td["nodes"][..., FEATURE_INDEX["node_type"][0] + NODE_TYPE_IC] == 1.0)
+        
+        for _ in range(num_nodes):
+            # I_out = sum(children's I_in)
+            i_out_sleep = (adj_matrix_T @ current_demands_sleep.unsqueeze(-1)).squeeze(-1)
+            
+            # I_in = I_self + I_out (for ICs)
+            new_demands_sleep = load_sleep_draw + ic_self_sleep
+            new_demands_sleep[ic_mask] += i_out_sleep[ic_mask] # IC의 수요에 I_out을 더함
+            
+            if torch.allclose(current_demands_sleep, new_demands_sleep):
+                break
+            current_demands_sleep = new_demands_sleep
+
+        # 5. 배터리에서 나가는 총 암전류 계산
+        battery_children_mask = adj_matrix[:, BATTERY_NODE_IDX, :] # (B, N)
+        total_sleep_current = (current_demands_sleep * battery_children_mask).sum(dim=1)
+        
+        return total_sleep_current # (B,)
 
 
     
-    # --- 👇 [핵심 5] get_reward 함수 시그니처 및 로직 변경 ---
+    # --- 👇 [핵심 5] get_reward 함수 시그니처 변경 ---
     def get_reward(self,
                    td: TensorDict,
                    step_reward: torch.Tensor, # _step에서 계산된 기본 보상
@@ -612,16 +703,38 @@ class PocatEnv(EnvBase):
 
         """
         보상을 계산합니다.
-        - 기본 보상 (Dense/Intermediate): _step에서 계산된 값 (스텝 페널티 + R_action + R_path)
-        - 최종 보상 (Sparse): *실패* 페널티만 적용
+        - 기본 보상: _step에서 계산된 값 (스텝 페널티 + R_action + R_path)
+        - 최종 보상: *실패* 페널티 (경로 실패, 암전류 위반)
         """
 
         reward = step_reward.clone()
 
+        # --- 👇 [암전류] 암전류 제약 검사 ---
+        if done_successfully.any():
+            td_success = td[done_successfully]
+            total_sleep_current = self._calculate_total_sleep_current(td_success)
+            
+            # scalar_prompt index 1 is max_sleep_current
+            max_sleep_current = td_success["scalar_prompt_features"][:, 1]
+            
+            # --- 👇 [힌지 페널티 수정] ---
+            # (B_success,)
+            violation_amount = total_sleep_current - max_sleep_current
+            # Hinge Loss: max(0, violation_amount)
+            hinge_violation = torch.relu(violation_amount) # 0 미만(위반 안 함)은 0으로 처리
+
+            # 증분형(Incremental) 페널티 계산 (양수 값)
+            sleep_penalty = PENALTY_WEIGHT_SLEEP * hinge_violation
+            
+            # [Point 2 Fix] reward[done_successfully]에 직접 페널티 차감 (음수 보상에 더함)
+            reward[done_successfully] -= sleep_penalty
+            # --- [힌지 페널티] 수정 완료 ---
+
+        # --- [암전류] 검사 완료 ---
         # R_fail (실패 페널티)
         # 실패 시, 이전까지의 보상을 모두 덮어쓰고 강력한 페널티를 부여
 
         failed = (timed_out | is_stuck_or_finished) & ~done_successfully
         if failed.any():
             reward[failed] = FAILURE_PENALTY            
-        return reward
+        return reward # (B,) 텐서. 호출부(_step)에서 (B, 1)로 unsqueeze함.

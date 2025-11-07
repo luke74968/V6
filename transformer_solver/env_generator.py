@@ -226,6 +226,9 @@ class PocatGenerator:
                 features[idx, FEATURE_INDEX["independent_rail_type"]] = 1.0
             elif rail_type == "exclusive_path":
                 features[idx, FEATURE_INDEX["independent_rail_type"]] = 2.0
+            # 👈 [암전류] always_on_in_sleep 피처를 텐서에 추가
+            features[idx, FEATURE_INDEX["always_on_in_sleep"]] = 1.0 if load_conf.get("always_on_in_sleep", False) else 0.0
+
             # (값이 없으면 기본값인 0.0으로 유지됩니다)
         return features
 

@@ -18,23 +18,23 @@ FEATURE_INDEX = {
     "i_limit": 8,
     "current_active": 9,
     "current_sleep": 10,
-    "current_out": 11,          # (신규) IC의 현재 총 출력 전류 (동적)
-    "ic_type_idx": 12,          # (신규) 0: N/A, 1: LDO, 2: Buck (정적)
-    "op_current": 13,           # (신규) LDO의 동작 전류 (정적)
-    "efficiency_params": (14, 17), # (신규) Buck 손실 계산 계수 a,b,c (정적)
-    "theta_ja": 17,             # (신규) 열저항 (정적)
-    "t_junction_max": 18,       # (신규) 최대 허용 정션 온도 (정적)
-    "junction_temp": 19,        # (신규) 현재 정션 온도 (동적)
-    "quiescent_current": 20,    # (추가) 대기 전류 (정적)
-    "shutdown_current": 21,     # (추가) 차단 전류 (정적)
-    "independent_rail_type": 22,    # 👇 [추가] 독립 조건 피처 (0: 없음, 1: supplier, 2: path)
-    "node_id": 23,    # 👇 [추가 2] 노드 고유 ID
-
+    "current_out": 11,              # (신규) IC의 현재 총 출력 전류 (동적)
+    "ic_type_idx": 12,              # (신규) 0: N/A, 1: LDO, 2: Buck (정적)
+    "op_current": 13,               # (신규) LDO의 동작 전류 (정적)
+    "efficiency_params": (14, 17),  # (신규) Buck 손실 계산 계수 a,b,c (정적)
+    "theta_ja": 17,                 # (신규) 열저항 (정적)
+    "t_junction_max": 18,           #  최대 허용 정션 온도 (정적)
+    "junction_temp": 19,            #  현재 정션 온도 (동적)
+    "quiescent_current": 20,        #  대기 전류 (정적)
+    "shutdown_current": 21,         #  차단 전류 (정적)
+    "independent_rail_type": 22,    #  독립 조건 피처 (0: 없음, 1: supplier, 2: path)
+    "node_id": 23,                  #  노드 고유 ID
+    "always_on_in_sleep": 24,       #  [암전류] Always-On 여부 (정적)
 
 }
 
 # 전체 피처 차원
-FEATURE_DIM = 24
+FEATURE_DIM = 25
 # 💡 수정: 기존 PROMPT_FEATURE_DIM을 SCALAR_PROMPT_FEATURE_DIM으로 변경
 SCALAR_PROMPT_FEATURE_DIM = 4
 
