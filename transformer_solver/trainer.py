@@ -11,13 +11,16 @@ import json
 import logging
 
 from .utils.common import TimeEstimator, clip_grad_norms, unbatchify, batchify
-from .model import PocatModel
+from .model import PocatModel, PrecomputedCache, reshape_by_heads
 from .solver_env import PocatEnv
 
 from common.data_classes import Battery, LDO, BuckConverter, Load
 from .definitions import PocatConfig, NODE_TYPE_IC, FEATURE_INDEX
 from .solver_env import BATTERY_NODE_IDX
 from graphviz import Digraph
+
+from .expert_dataset import ExpertReplayDataset, expert_collate_fn
+from torch.utils.data import DataLoader
 
 
 def update_progress(pbar, metrics):
@@ -87,6 +90,92 @@ class PocatTrainer:
         with torch.no_grad():
             self._eval_td_fixed = self.env.reset(batch_size=self.eval_batch_size).clone()
         self.best_eval_bom = float("inf")
+
+    # --- 👇 [신규] Critic 사전훈련 함수 ---
+    def pretrain_critic(self, expert_data_path: str, pretrain_epochs: int = 5, pretrain_batch_size: int = 64):
+        """
+        '정답지' 데이터셋을 사용하여 A2C 모델의 Critic(value_head)만 사전훈련합니다.
+        """
+        args = self.args
+        args.log("=================================================================")
+        args.log(f"🧠 Critic 사전훈련(Pre-training) 시작...")
+        args.log(f"   - 정답지 경로: {expert_data_path}")
+        args.log(f"   - 에포크: {pretrain_epochs}, 배치 크기: {pretrain_batch_size}")
+
+        # 1. '정답지 리플레이' 데이터셋 로드
+        try:
+            expert_dataset = ExpertReplayDataset(expert_data_path, self.env, self.device)
+            if len(expert_dataset) == 0:
+                args.log("❌ 오류: '정답지' 데이터셋이 비어있어 사전훈련을 건너뜁니다.")
+                return
+            
+            expert_loader = DataLoader(
+                expert_dataset,
+                batch_size=pretrain_batch_size,
+                shuffle=True, # 지도학습이므로 셔플링
+                num_workers=0, # (환경 객체 직렬화 문제로 0 권장)
+                collate_fn=expert_collate_fn # 👈 [수정] 커스텀 collate 함수 지정
+            )
+        except Exception as e:
+            args.log(f"❌ 오류: '정답지' 데이터셋 로드 실패: {e}")
+            return
+
+        # 2. Critic 파라미터만 학습하는 별도의 옵티마이저 생성
+        critic_params = list(self.model.decoder.value_head.parameters())
+        # (선택) Critic이 사용하는 공통 레이어(MHA)도 함께 학습
+        # critic_params += list(self.model.decoder.Wq_context.parameters())
+        # critic_params += list(self.model.decoder.multi_head_combine.parameters())
+        
+        critic_optimizer = torch.optim.AdamW(
+            critic_params,
+            lr=float(args.optimizer_params['optimizer']['lr']) # A2C와 동일한 LR 사용
+        )
+
+        self.model.train() # 모델을 훈련 모드로
+
+        for epoch in range(1, pretrain_epochs + 1):
+            pbar = tqdm(expert_loader, desc=f"Critic Pre-train Epoch {epoch}/{pretrain_epochs}", dynamic_ncols=True)
+            total_v_loss = 0
+            
+            for state_td_batch, target_reward_batch in pbar:
+                critic_optimizer.zero_grad()
+                # --- 👇 [BUG FIX] ---
+                # DataLoader가 (B, 1, ...)로 묶어준 배치에서 불필요한 1차원을 제거
+                state_td_batch = state_td_batch.squeeze(1)
+                # target_reward_batch는 (B, 1)이므로 squeeze 불필요
+                # 3. 모델의 인코더/디코더 로직 실행 (model.forward()와 유사)
+
+                prompt_embedding = self.model.prompt_net(state_td_batch["scalar_prompt_features"], state_td_batch["matrix_prompt_features"])
+                encoded_nodes = self.model.encoder(state_td_batch, prompt_embedding)
+                
+                glimpse_key = reshape_by_heads(self.model.decoder.Wk(encoded_nodes), self.model.decoder.head_num)
+                glimpse_val = reshape_by_heads(self.model.decoder.Wv(encoded_nodes), self.model.decoder.head_num)
+                logit_key = encoded_nodes.transpose(1, 2)
+                cache = PrecomputedCache(encoded_nodes, glimpse_key, glimpse_val, logit_key)
+                
+                # 4. Critic의 가치 예측 (Actor의 scores는 무시)
+                _ , predicted_value = self.model.decoder(state_td_batch, cache) # (B, 1)
+                
+                # 5. [핵심] V_Loss 계산: Critic의 예측 vs "정답지"의 실제 보상
+                # target_reward_batch는 (B, 1), predicted_value는 (B, 1)
+                critic_loss = F.mse_loss(predicted_value, target_reward_batch)
+                
+                # 6. Critic 파라미터만 업데이트
+                critic_loss.backward()
+                critic_optimizer.step()
+                
+                total_v_loss += critic_loss.item()
+                pbar.set_postfix({"V_Loss (Pre)": f"{critic_loss.item():.4f}"})
+
+            args.log(f"Critic Pre-train Epoch {epoch} | Avg V_Loss: {total_v_loss / len(expert_loader):.4f}")
+
+        args.log("✅ Critic 사전훈련 완료.")
+        args.log("=================================================================")
+    # --- [신규] 함수 종료 ---
+
+
+
+
 
     def run(self):
         args = self.args

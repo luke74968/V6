@@ -1,11 +1,12 @@
-# interactive_debugger.py
+# transformer_solver/debug_env.py
 import torch
 import argparse
 import sys
 import os
 
 # 프로젝트 루트 경로를 sys.path에 추가하여 모듈을 찾을 수 있도록 함
-sys.path.append(os.path.abspath(os.path.dirname(__file__)))
+# 💡 [수정] 경로 추가 로직을 좀 더 안정적으로 변경
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from transformer_solver.solver_env import PocatEnv, BATTERY_NODE_IDX
 
@@ -52,23 +53,33 @@ def run_interactive_debugger(config_file):
         
         # 3. 모든 노드에 대한 마스킹 결과와 이유 출력
         print("\n--- Masking Details ---")
-        header = f"{'Node Name':<50} | {'VALID?':<8} | " + " | ".join(f"{k:<12}" for k in reasons.keys())
-        print(header)
-        print("-" * len(header))
+        
+        # 💡 [수정] reasons 딕셔너리가 비어있지 않은지 확인 (중요)
+        if not reasons:
+             print(f"{'Node Name':<50} | {'VALID?':<8}")
+             print("-" * 61)
+        else:
+            header = f"{'Node Name':<50} | {'VALID?':<8} | " + " | ".join(f"{k:<12}" for k in reasons.keys())
+            print(header)
+            print("-" * len(header))
 
         for idx, name in enumerate(node_names):
             is_valid = final_mask[idx].item()
             if is_valid:
                 valid_actions.append(name)
 
-            if not reasons: # [Select Load] 모드일 경우
-                if is_valid:
+            # 💡 [수정] reasons가 비어있을 때(예: [Select Load] 모드)와
+            #          reasons가 있을 때([Find Parent] 모드)를 분리하여 처리
+            if not reasons:
+                if is_valid: # [Select Load] 모드일 경우 유효한 것만 출력
                     print(f"{name:<50} | {'✅ YES':<8}")
                 continue
-
-            # [Find Parent] 모드일 경우 모든 이유 출력
-            reason_str = " | ".join(f"{('✅' if reasons[k][idx] else '❌'):<12}" for k in reasons.keys())
-            print(f"{name:<50} | {('✅ YES' if is_valid else '❌ NO'):<8} | {reason_str}")
+            else:
+                # --- 👇 [핵심 버그 수정] ---
+                # reasons[k][idx] -> reasons[k][0, idx]로 수정
+                reason_str = " | ".join(f"{('✅' if reasons[k][0, idx] else '❌'):<12}" for k in reasons.keys())
+                # --- 수정 완료 ---
+                print(f"{name:<50} | {('✅ YES' if is_valid else '❌ NO'):<8} | {reason_str}")
 
         print("\n--- Valid Actions ---")
         if not valid_actions:
@@ -98,7 +109,9 @@ def run_interactive_debugger(config_file):
         td = output["next"]
 
     print("\n🎉 Power Tree construction finished!")
-    print(f"Final Cost: ${-output['reward'].item():.4f}")
+    # 💡 [수정] reward가 스칼라가 아닐 수 있으므로 .item() 추가
+    final_reward = output['reward'].item() if output['reward'].numel() == 1 else output['reward'][0].item()
+    print(f"Final Cost: ${-final_reward:.4f}")
 
 
 if __name__ == "__main__":

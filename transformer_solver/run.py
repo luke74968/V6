@@ -9,6 +9,8 @@ import torch
 import logging
 import argparse
 
+from . import model
+
 if torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 8:
     torch.set_float32_matmul_precision('high')
 
@@ -40,6 +42,11 @@ def main(args):
     
     trainer = PocatTrainer(args, env, device)
 
+    # --- 👇 [신규] Critic 사전훈련 실행 ---
+    if args.pretrain_critic:
+        trainer.pretrain_critic(expert_data_path=args.pretrain_critic, 
+                                pretrain_epochs=args.pretrain_epochs)
+
     if args.test_only:
         trainer.test()
     else:
@@ -63,7 +70,12 @@ if __name__ == "__main__":
     # 💡 추론을 위한 인자 추가
     parser.add_argument('--test_only', action='store_true', help="Only run test/inference")
     parser.add_argument('--load_path', type=str, default=None, help="Path to a saved model checkpoint (.pth)")
-    
+
+    # --- 👇 [신규] Critic 사전훈련 인자 ---
+    parser.add_argument('--pretrain_critic', type=str, default=None, 
+                        help="Path to expert_data.json for Critic pre-training.")
+    parser.add_argument('--pretrain_epochs', type=int, default=5, help="Number of epochs for Critic pre-training.")    
+
     # 💡 로그 관련 인자 추가
     parser.add_argument('--log_idx', type=int, default=0, help='Instance index to log (for POMO)')
     parser.add_argument('--log_mode', type=str, default='progress', choices=['progress', 'detail'],

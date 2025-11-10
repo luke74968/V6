@@ -1,9 +1,9 @@
-# transformer_solver/pocat_env.py
+# transformer_solver/solver_env.py
 
 import torch
 from tensordict import TensorDict
 from torchrl.envs import EnvBase
-from typing import Optional, Dict, Union
+from typing import Optional, Dict, Union, Tuple
 
 from torchrl.data import Unbounded, UnboundedDiscrete, Composite
 
@@ -21,9 +21,9 @@ REWARD_WEIGHT_PATH = 1.0
 # 스텝 페널티: 경로를 불필요하게 길게 만드는 것을 방지
 STEP_PENALTY = 0
 # R_fail: 실패 시 페널티
-FAILURE_PENALTY = -100.0
+FAILURE_PENALTY = -500.0
 # 👈 [암전류] 초과된 암전류 1A당 페널티 (음수 보상) 크기
-PENALTY_WEIGHT_SLEEP = 1000.0 # 예: 1mA(0.001A) 초과 시 -10.0의 페널티
+PENALTY_WEIGHT_SLEEP = 1000.0 # 예: Penalty = 10000 1mA(0.001A) 초과 시 -10.0의 페널티
 
 BATTERY_NODE_IDX = 0
 
@@ -187,6 +187,7 @@ class PocatEnv(EnvBase):
             "staging_cost": torch.zeros(batch_size, 1, dtype=torch.float32, device=self.device), #
             "is_used_ic_mask": torch.zeros(batch_size, num_nodes, dtype=torch.bool, device=self.device),
             "current_target_load": torch.full((batch_size, 1), -1, dtype=torch.long, device=self.device),
+            "action": torch.full((batch_size, 1), -1, dtype=torch.long, device=self.device), # 👈 [BUG FIX] 'action' 키 추가
             "is_exclusive_mask": torch.zeros(batch_size, num_nodes, dtype=torch.long, device=self.device), # 👈 [신규] 0으로 초기화
         }, batch_size=[batch_size], device=self.device)
        
@@ -201,6 +202,57 @@ class PocatEnv(EnvBase):
     # 💡 추가된 step 메소드: 배치 크기 검사를 우회합니다.
     def step(self, tensordict: TensorDict) -> TensorDict:
         return self._step(tensordict)
+
+    # 💡 [신규] 헬퍼 함수: 전체 트리의 부하/발열을 계산 (기존 _step 로직에서 분리)
+    def _calculate_tree_loads(self, nodes_tensor: torch.Tensor, adj_matrix: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Calculates the full tree's current, power loss, and junction temperatures based on an adjacency matrix.
+        Returns: (final_i_out, power_loss, junction_temp)
+        """
+        batch_size, num_nodes, _ = nodes_tensor.shape
+        
+        # 1. Initial demands = active current of loads
+        current_demands = nodes_tensor[..., FEATURE_INDEX["current_active"]].clone()
+        ic_mask_b_n = (nodes_tensor[..., FEATURE_INDEX["node_type"][0] + NODE_TYPE_IC] == 1.0)
+        current_demands[ic_mask_b_n] = 0.0
+        
+        adj_matrix_T = adj_matrix.float().transpose(-1, -2)
+        
+        # 2. Propagate currents up the tree
+        for _ in range(num_nodes):
+            i_out = (adj_matrix_T @ current_demands.unsqueeze(-1)).squeeze(-1)
+            
+            op_current = nodes_tensor[..., FEATURE_INDEX["op_current"]]
+            i_in_ldo = i_out + op_current
+            
+            vout = nodes_tensor[..., FEATURE_INDEX["vout_min"]]
+            vin = nodes_tensor[..., FEATURE_INDEX["vin_min"]]
+            p_out_buck = vout * i_out
+            eff = 0.9 # Simplified efficiency for env calculation
+            safe_vin = torch.where(vin > 0, vin, 1e-6)
+            i_in_buck = (p_out_buck / eff) / safe_vin + op_current
+            
+            new_demands = current_demands.clone()
+            ldo_mask_b = (nodes_tensor[..., FEATURE_INDEX["ic_type_idx"]] == 1.0)
+            buck_mask_b = (nodes_tensor[..., FEATURE_INDEX["ic_type_idx"]] == 2.0)
+            
+            new_demands[ldo_mask_b] = i_in_ldo[ldo_mask_b]
+            new_demands[buck_mask_b] = i_in_buck[buck_mask_b]
+            
+            if torch.allclose(current_demands, new_demands):
+                break
+            current_demands = new_demands
+            
+        # 3. Final calculations
+        final_i_out = (adj_matrix_T @ current_demands.unsqueeze(-1)).squeeze(-1)
+        power_loss = self._calculate_power_loss(nodes_tensor, final_i_out)
+        theta_ja = nodes_tensor[..., FEATURE_INDEX["theta_ja"]]
+        ambient_temp = self.generator.config.constraints.get("ambient_temperature", 25.0)
+        junction_temp = ambient_temp + power_loss * theta_ja
+        
+        return final_i_out, power_loss, junction_temp
+
+
 
     def _calculate_power_loss(self, ic_node_features: torch.Tensor, i_out: torch.Tensor) -> torch.Tensor:
         ic_type = ic_node_features[:, :, FEATURE_INDEX["ic_type_idx"]]
@@ -305,10 +357,26 @@ class PocatEnv(EnvBase):
 
                 # [Point 1, 5 Fix] dtype을 child_status.dtype (long)으로 통일
                 zero_tensor = torch.tensor(0, device=self.device, dtype=child_status.dtype)
-                # 'Path(2)'만 상위로 전파됨.
+                # --- 👇 [버그 수정] exclusive_supplier(1)가 IC를 거슬러 전파되는 문제 수정 ---
+                
+                # [A] status_to_propagate: 'Path(2)'인 경우에만 2를, 그 외(0, 1)에는 0을 전파                
                 status_to_propagate = torch.where(child_status == 2, child_status, zero_tensor)
-                # 부모는 (1)자신의 상태, (2)전파된 Path, (3)자식의 Supplier(1) 상태 중 가장 높은 값을 가짐.
-                status_from_child = torch.where(child_status == 1, child_status, status_to_propagate)
+
+                # [B] is_child_load: (B_act,) 텐서. 현재 child_node가 Load인지 확인
+                #     (self.node_type_tensor는 (N,) 이므로 child_node (B_act,)로 인덱싱)
+                is_child_load = (self.node_type_tensor[child_node] == NODE_TYPE_LOAD)
+
+                # [C] status_from_supplier: 'Supplier(1)'이면서 'Load'인 경우에만 1을, 그 외에는 0을 설정
+                status_from_supplier = torch.where(
+                    (child_status == 1) & is_child_load, # 조건: Supplier(1)이면서 Load
+                    child_status,                      # 참: 1을 사용
+                    zero_tensor                        # 거짓: 0을 사용 (IC가 1이어도 전파 안 함)
+                )
+
+                # [D] 부모는 (1)자신의 상태, (2)전파된 Path(2), (3)자식 Load의 Supplier(1) 중 가장 높은 값을 가짐
+                status_from_child = torch.max(status_to_propagate, status_from_supplier)
+                
+                # [E] 최종 부모 상태 업데이트
                 new_parent_status = torch.max(parent_status, status_from_child)
                 next_obs["is_exclusive_mask"][node_rows, parent_node] = new_parent_status
             # --- '표기' 전파 완료 ---
@@ -327,53 +395,14 @@ class PocatEnv(EnvBase):
                 next_obs["current_target_load"][finished_rows, 0] = -1
 
         # 5. 전류, 온도, 비용 업데이트
-        # 1. 초기 전류 수요는 Load의 active_current로 설정
-        current_demands = next_obs["nodes"][..., FEATURE_INDEX["current_active"]].clone()
-        ic_mask_b_n = (next_obs["nodes"][..., FEATURE_INDEX["node_type"][0] + NODE_TYPE_IC] == 1.0)
-        current_demands[ic_mask_b_n] = 0.0 # (B, N) 마스크를 (B, N) 텐서에 직접 적용
-        
-        adj_matrix_T = next_obs["adj_matrix"].float().transpose(-1, -2)
+        # 계산된 최종 상태를 텐서에 업데이트
+        # (B, N, D), (B, N, N)
+        final_i_out, power_loss, new_temp = self._calculate_tree_loads(
+            next_obs["nodes"], 
+            next_obs["adj_matrix"]
+        )
 
-        # 2. 트리 레벨 수만큼 반복하여 전류를 위로 전파
-        for _ in range(num_nodes):
-            # 각 노드의 출력 전류(I_out)는 모든 자식 노드들의 수요(current_demands) 합
-            i_out = (adj_matrix_T @ current_demands.unsqueeze(-1)).squeeze(-1)
-            
-            # 각 IC의 입력 전류(I_in) 계산
-            op_current = next_obs["nodes"][..., FEATURE_INDEX["op_current"]]
-            
-            # LDO I_in = I_out + I_op
-            i_in_ldo = i_out + op_current
-            
-            # Buck의 I_in = P_in / V_in + I_op = (P_out / eff) / V_in + I_op
-            vout = next_obs["nodes"][..., FEATURE_INDEX["vout_min"]]
-            vin = next_obs["nodes"][..., FEATURE_INDEX["vin_min"]]
-            p_out_buck = vout * i_out
-            # 환경 내에서는 복잡한 효율 곡선 대신 단순화된 고정 효율(예: 90%) 사용
-            eff = 0.9 
-            # vin이 0인 경우를 방지
-            safe_vin = torch.where(vin > 0, vin, 1e-6)
-            i_in_buck = (p_out_buck / eff) / safe_vin + op_current
-            # 다음 반복을 위해 IC 노드의 수요를 새로 계산된 I_in 값으로 업데이트
-            new_demands = current_demands.clone()
-            ldo_mask_b = (next_obs["nodes"][..., FEATURE_INDEX["ic_type_idx"]] == 1.0)
-            buck_mask_b = (next_obs["nodes"][..., FEATURE_INDEX["ic_type_idx"]] == 2.0)
-            
-            new_demands[ldo_mask_b] = i_in_ldo[ldo_mask_b]
-            new_demands[buck_mask_b] = i_in_buck[buck_mask_b]
-            
-            # 더 이상 수요가 변하지 않으면(계산 완료) 루프 종료
-            if torch.allclose(current_demands, new_demands):
-                break
-            current_demands = new_demands
-            
-        # 3. 최종적으로 계산된 current_out을 사용하여 전력 손실 및 온도 계산
-        final_i_out = (adj_matrix_T @ current_demands.unsqueeze(-1)).squeeze(-1)
         next_obs["nodes"][..., FEATURE_INDEX["current_out"]] = final_i_out
-        power_loss = self._calculate_power_loss(next_obs["nodes"], final_i_out)
-        theta_ja = next_obs["nodes"][..., FEATURE_INDEX["theta_ja"]]
-        ambient_temp = self.generator.config.constraints.get("ambient_temperature", 25.0)
-        new_temp = ambient_temp + power_loss * theta_ja
         next_obs["nodes"][..., FEATURE_INDEX["junction_temp"]] = new_temp
         
         node_costs = next_obs["nodes"][:, :, FEATURE_INDEX["cost"]]
@@ -451,7 +480,11 @@ class PocatEnv(EnvBase):
 # 💡 *** 여기가 핵심 수정 부분입니다 (get_action_mask) ***
     def get_action_mask(self, td: TensorDict, debug: bool = False) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
         self._ensure_buffers(td) # 맨 앞에서 버퍼 동기화
-        
+
+        # 💡 [최적화] VRAM과 속도를 맞바꾸는 시뮬레이션 청크 크기
+        # (메모리 부족 시 16, 8 등으로 조정 필요 
+        SIM_CHUNK_SIZE = 32
+
         batch_size, num_nodes, _ = td["nodes"].shape
         mask = torch.zeros(batch_size, num_nodes, dtype=torch.bool, device=self.device)
         current_head = td["trajectory_head"].squeeze(-1)
@@ -504,18 +537,7 @@ class PocatEnv(EnvBase):
             path_mask = self._trace_path_batch(child_nodes, td["adj_matrix"][b_idx_node])
             cycle_ok = ~path_mask
 
-            # --- 3. 전류 한계 ---
-            nodes_slice = td["nodes"][b_idx_node] # (B_act, N, D)
-            rows = torch.arange(B_act, device=self.device) # (B_act,)
-            # (B_act, N)
-            remaining_capacity = nodes_slice[:, :, FEATURE_INDEX["i_limit"]] - nodes_slice[:, :, FEATURE_INDEX["current_out"]]
-            # (B_act,) -> (B_act, 1)
-            child_current_draw = nodes_slice[rows, child_nodes, FEATURE_INDEX["current_active"]].unsqueeze(1)
-            # (B_act, N)
-            current_ok = (remaining_capacity >= child_current_draw) | is_battery_mask
-
-            
-            # --- 4. [버그 수정] 독립(Exclusive) 조건 ---
+            # --- 3. [버그 수정] 독립(Exclusive) 조건 ---
             # (a) 현재 Head(child_nodes)의 상태 식별
             # (B_act,)
             head_status = td["is_exclusive_mask"][b_idx_node, child_nodes]
@@ -551,9 +573,9 @@ class PocatEnv(EnvBase):
             exclusive_ok = torch.logical_not(violations) | is_battery_mask
             # --- [버그 수정 완료] ---
             # --- 5. 최종 결합 ---
-            can_be_parent = (
+            candidate_mask = (
                 not_load_parent & not_self_parent & volt_ok & cycle_ok & 
-                current_ok & exclusive_ok 
+                exclusive_ok
             )
 
             # --- 6. Power Sequence (루프 필요) ---
@@ -577,7 +599,7 @@ class PocatEnv(EnvBase):
                         
                         if f_flag == 1:
                             same_parent_mask = (self.arange_nodes == parent_of_j_idx.unsqueeze(1))
-                            can_be_parent[inst_constr] &= ~same_parent_mask
+                            candidate_mask[inst_constr] &= ~same_parent_mask
 
                 # Case 2: 현재 child가 'j'일 때 (j의 부모를 찾는 중)
                 is_j_mask = (child_nodes == j_idx)
@@ -594,25 +616,109 @@ class PocatEnv(EnvBase):
                         
                         anc_mask = self._trace_path_batch(parent_of_k_idx, td["adj_matrix"][b_constr])
                         anc_mask[:, BATTERY_NODE_IDX] = False # 조상 마스크에서 배터리 제외
-                        can_be_parent[inst_constr] &= ~anc_mask
+                        candidate_mask[inst_constr] &= ~anc_mask
                         
                         if f_flag == 1:
                             same_parent_mask = (self.arange_nodes == parent_of_k_idx.unsqueeze(1))
-                            can_be_parent[inst_constr] &= ~same_parent_mask
+                            candidate_mask[inst_constr] &= ~same_parent_mask
+            # --- 5. [신규] 단일 부모 잠금 (Single-Parent Lock) ---
+            # (B_act, N, N)
+            base_adj_matrix = td["adj_matrix"][b_idx_node]
+            # (B_act, N, D)
+
+            # (B_act, N_nodes) - adj_matrix[b, :, child_node] -> child_node의 부모들
+            existing_parents_mask = base_adj_matrix[torch.arange(B_act), :, child_nodes]
+            
+            # (B_act,) - 이미 부모가 한 명이라도 있는지 여부
+            has_existing_parent = existing_parents_mask.any(dim=-1)
+            
+            # 💡 [핵심] 부모가 이미 있는 인스턴스(has_existing_parent)에 대해서는...
+            # ... candidate_mask를 '기존 부모 마스크'로 덮어쓴다.
+            # 즉, "너의 유일한 후보는 너의 기존 부모뿐이다."
+            if has_existing_parent.any():
+                candidate_mask[has_existing_parent] = existing_parents_mask[has_existing_parent]
+            
+            # (참고: 부모가 없는 인스턴스의 candidate_mask는 그대로 유지됨)
+            
+            # --- 6. [핵심 최적화] Chunk-based Full Tree Simulation ---
+
+
+            # --- 7. [핵심 최적화] Chunk-based Full Tree Simulation ---
+
+            base_nodes = td["nodes"][b_idx_node]
+            
+            # (B_act, N_nodes) - 시뮬레이션 결과를 저장할 마스크
+            current_and_thermal_ok = candidate_mask.clone()
+
+            # 💡 [최적화] parent_idx를 1개씩 순회하는 대신 SIM_CHUNK_SIZE (예: 32개) 묶음으로 순회
+            for chunk_start in range(0, num_nodes, SIM_CHUNK_SIZE):
+                chunk_end = min(chunk_start + SIM_CHUNK_SIZE, num_nodes)
+                current_chunk_size = chunk_end - chunk_start
+                parent_indices_in_chunk = torch.arange(chunk_start, chunk_end, device=self.device)
+
+                # (B_act, N_chunk) - 현재 청크에서 유효한 (인스턴스, 부모) 후보
+                candidates_in_chunk_mask = candidate_mask[:, chunk_start:chunk_end]
+
+                # (N_sim,) - (B_act 기준 인덱스, 로컬 부모 인덱스)
+                b_idx_sim_chunk, p_idx_sim_chunk_local = candidates_in_chunk_mask.nonzero(as_tuple=True)
+                
+                if b_idx_sim_chunk.numel() == 0:
+                    continue # 이 청크에 시뮬레이션할 유효한 후보가 없으면 스킵
+                
+                N_sim = b_idx_sim_chunk.numel()
+
+                # 💡 (N_sim, ...) 크기로 데이터 확장
+                sim_nodes = base_nodes[b_idx_sim_chunk]
+                sim_adj_matrix = base_adj_matrix[b_idx_sim_chunk].clone() # 복제 필수
+                sim_child_nodes = child_nodes[b_idx_sim_chunk]
+                
+                # (N_sim,) - 각 시뮬레이션이 연결할 *실제* 부모 노드 인덱스
+                sim_parent_indices_global = parent_indices_in_chunk[p_idx_sim_chunk_local]
+                
+                # 💡 [벡터화] (N_sim,)개의 엣지를 병렬로 추가
+                sim_rows = torch.arange(N_sim, device=self.device)
+                sim_adj_matrix[sim_rows, sim_parent_indices_global, sim_child_nodes] = True
+                
+                # 🚀 (N_sim,) 배치에 대해 연쇄 효과 전체 시뮬레이션 실행
+                (final_i_out, power_loss, junction_temp) = self._calculate_tree_loads(sim_nodes, sim_adj_matrix)
+
+                # 💡 [벡터화] (N_sim, N) IC 노드 마스크 생성
+                ic_mask_sim = (sim_nodes[..., FEATURE_INDEX["node_type"][0] + NODE_TYPE_IC] == 1.0)
+
+                i_limit = sim_nodes[..., FEATURE_INDEX["i_limit"]]
+                t_max = sim_nodes[..., FEATURE_INDEX["t_junction_max"]]
+
+                current_check_ok = (final_i_out <= i_limit + 1e-6)
+                temp_check_ok = (junction_temp <= t_max + 1e-6)
+
+                # (N_sim, N) -> (N_sim,)
+                all_currents_ok = (current_check_ok | ~ic_mask_sim).all(dim=-1)
+                all_temps_ok = (temp_check_ok | ~ic_mask_sim).all(dim=-1)
+                
+                # (N_sim,)
+                is_valid_simulation = all_currents_ok & all_temps_ok
+
+                # 💡 [벡터화] 시뮬레이션에 실패한 (인스턴스, 부모) 쌍을 최종 마스크에서 제외
+                failed_sim_mask = ~is_valid_simulation
+                if failed_sim_mask.any():
+                    # (N_failed,)
+                    b_idx_failed = b_idx_sim_chunk[failed_sim_mask]
+                    p_idx_failed_global = sim_parent_indices_global[failed_sim_mask]
+                    # (B_act, N) 마스크에 실패 결과 병렬 업데이트
+                    current_and_thermal_ok[b_idx_failed, p_idx_failed_global] = False
 
             # 최종 마스크를 전체 배치 마스크에 적용
-            mask[head_is_node] = can_be_parent
+            mask[head_is_node] = current_and_thermal_ok
 
             if debug:
-                # [Find Parent] 모드 이유를 덮어쓰기
                 reasons.update({ 
                      "Not Load": not_load_parent,
                      "Not Self": not_self_parent,
                      "Volt OK": volt_ok,
                      "Cycle OK": cycle_ok,
-                     "Current OK": current_ok,
                      "Exclusive OK": exclusive_ok, # 수정된 최종 로직
-                     "Sequence OK": can_be_parent # Power Sequence까지 적용된 최종본
+                     "Sim OK": current_and_thermal_ok, # 💡 시뮬레이션 결과 마스크
+                     "Sequence OK": candidate_mask # 시뮬레이션 직전 마스크
                  })
 
         # --- 3. 최종 반환 ---
