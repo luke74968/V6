@@ -213,13 +213,23 @@ class PocatEnv(EnvBase):
         
         # 1. Initial demands = active current of loads
         current_demands = nodes_tensor[..., FEATURE_INDEX["current_active"]].clone()
-        ic_mask_b_n = (nodes_tensor[..., FEATURE_INDEX["node_type"][0] + NODE_TYPE_IC] == 1.0)
+        
+        # --- 👇 [핵심 수정] 'argmax'를 사용하여 IC 타입을 정확히 마스킹 ---
+        nt_s, nt_e = FEATURE_INDEX["node_type"]
+        sim_types = nodes_tensor[..., nt_s:nt_e].argmax(dim=-1) # (B, N)
+        ic_mask_b_n = (sim_types == NODE_TYPE_IC) # (B, N)
+        # --- 수정 완료 ---
+        
         current_demands[ic_mask_b_n] = 0.0
         
         adj_matrix_T = adj_matrix.float().transpose(-1, -2)
         
+        # --- [수정 1] i_out을 루프 밖에서 선언 ---
+        i_out = torch.zeros_like(current_demands)
+
         # 2. Propagate currents up the tree
         for _ in range(num_nodes):
+            # --- [수정 2] i_out을 여기서 계산 (이것이 실제 출력 전류) ---
             i_out = (adj_matrix_T @ current_demands.unsqueeze(-1)).squeeze(-1)
             
             op_current = nodes_tensor[..., FEATURE_INDEX["op_current"]]
@@ -233,49 +243,64 @@ class PocatEnv(EnvBase):
             i_in_buck = (p_out_buck / eff) / safe_vin + op_current
             
             new_demands = current_demands.clone()
-            ldo_mask_b = (nodes_tensor[..., FEATURE_INDEX["ic_type_idx"]] == 1.0)
-            buck_mask_b = (nodes_tensor[..., FEATURE_INDEX["ic_type_idx"]] == 2.0)
+
+            # --- 👇 [핵심 수정] 'ic_type_idx' 피처(인덱스 12)를 직접 비교 ---
+            # [FIX] Use torch.isclose for float comparison
+            ic_type = nodes_tensor[..., FEATURE_INDEX["ic_type_idx"]]
+            ldo_mask_b = torch.isclose(ic_type, torch.tensor(1.0, device=ic_type.device))
+            buck_mask_b = torch.isclose(ic_type, torch.tensor(2.0, device=ic_type.device))
+            # --- 수정 완료 ---
             
             new_demands[ldo_mask_b] = i_in_ldo[ldo_mask_b]
             new_demands[buck_mask_b] = i_in_buck[buck_mask_b]
             
             if torch.allclose(current_demands, new_demands):
-                break
+                break # 루프가 안정화되면, 'i_out'은 최종 출력 전류 값을 가짐
             current_demands = new_demands
             
         # 3. Final calculations
-        final_i_out = (adj_matrix_T @ current_demands.unsqueeze(-1)).squeeze(-1)
-        power_loss = self._calculate_power_loss(nodes_tensor, final_i_out)
+        # --- [수정 3] 'final_i_out'을 다시 계산하는 버그 라인 삭제 ---
+        # final_i_out = (adj_matrix_T @ current_demands.unsqueeze(-1)).squeeze(-1) # <-- ❌ 이 줄을 삭제
+        
+        # --- [수정 4] 'i_out' (안정화된 최종 출력 전류)을 사용 ---
+        power_loss = self._calculate_power_loss(nodes_tensor, i_out)
         theta_ja = nodes_tensor[..., FEATURE_INDEX["theta_ja"]]
         ambient_temp = self.generator.config.constraints.get("ambient_temperature", 25.0)
         junction_temp = ambient_temp + power_loss * theta_ja
         
-        return final_i_out, power_loss, junction_temp
+        # --- [수정 5] 'i_out'을 반환 ---
+        return i_out, power_loss, junction_temp
 
 
 
     def _calculate_power_loss(self, ic_node_features: torch.Tensor, i_out: torch.Tensor) -> torch.Tensor:
-        ic_type = ic_node_features[:, :, FEATURE_INDEX["ic_type_idx"]]
-        vin = ic_node_features[:, :, FEATURE_INDEX["vin_min"]]
-        vout = ic_node_features[:, :, FEATURE_INDEX["vout_min"]]
+            # --- 👇 [핵심 수정] 'ic_type_idx' 피처(인덱스 12)를 직접 비교 ---
+            ic_type_val = ic_node_features[..., FEATURE_INDEX["ic_type_idx"]]
+            # --- 수정 완료 ---
 
-        power_loss = torch.zeros_like(i_out)
-        
-        # LDO
-        ldo_mask = ic_type == 1.0
-        if ldo_mask.any():
-            op_current = ic_node_features[:, :, FEATURE_INDEX["op_current"]]
-            power_loss[ldo_mask] = (vin[ldo_mask] - vout[ldo_mask]) * i_out[ldo_mask] + vin[ldo_mask] * op_current[ldo_mask]
-        
-        # Buck
-        buck_mask = ic_type == 2.0
-        if buck_mask.any():
-            s, e = FEATURE_INDEX["efficiency_params"]
-            a, b, c = ic_node_features[:, :, s:e].permute(2, 0, 1)
-            i_out_buck = i_out[buck_mask]
-            power_loss[buck_mask] = a[buck_mask] * (i_out_buck**2) + b[buck_mask] * i_out_buck + c[buck_mask]
+            vin = ic_node_features[:, :, FEATURE_INDEX["vin_min"]]
+            vout = ic_node_features[:, :, FEATURE_INDEX["vout_min"]]
+
+            power_loss = torch.zeros_like(i_out)
             
-        return power_loss
+            # LDO
+            ldo_mask = torch.isclose(ic_type_val, torch.tensor(1.0, device=ic_type_val.device))
+            if ldo_mask.any():
+                op_current = ic_node_features[:, :, FEATURE_INDEX["op_current"]]
+                power_loss[ldo_mask] = (vin[ldo_mask] - vout[ldo_mask]) * i_out[ldo_mask] + vin[ldo_mask] * op_current[ldo_mask]
+            
+            # Buck
+            buck_mask = torch.isclose(ic_type_val, torch.tensor(2.0, device=ic_type_val.device))
+
+            if buck_mask.any():
+                s, e = FEATURE_INDEX["efficiency_params"]
+                # 💡 [버그 수정] permute 순서 수정 (a,b,c가 (3, B, N)이 되어야 함)
+                a, b, c = ic_node_features[..., s:e].permute(2, 0, 1) 
+                i_out_buck = i_out[buck_mask]
+                power_loss[buck_mask] = a[buck_mask] * (i_out_buck**2) + b[buck_mask] * i_out_buck + c[buck_mask]
+                
+            return power_loss
+
 
     def _step(self, td: TensorDict) -> TensorDict:
         batch_size, num_nodes, _ = td["nodes"].shape
@@ -516,6 +541,9 @@ class PocatEnv(EnvBase):
             B_act = len(b_idx_node) # (B_act,)
             
             # --- [공통 마스크] ---
+            # --- [신규] 시뮬레이션 결과를 저장할 텐서 ---
+            sim_i_out_results = torch.full((B_act, num_nodes), -1.0, dtype=torch.float32, device=self.device)
+            sim_tj_results = torch.full((B_act, num_nodes), -1.0, dtype=torch.float32, device=self.device)
             # (1, N_nodes) -> (B_act, N_nodes)
             is_battery_mask = (self.arange_nodes.unsqueeze(0) == BATTERY_NODE_IDX).expand(B_act, -1)
             # (1, N_nodes) -> (B_act, N_nodes)
@@ -595,7 +623,7 @@ class PocatEnv(EnvBase):
                         
                         anc_mask = self._trace_path_batch(parent_of_j_idx, td["adj_matrix"][b_constr])
                         anc_mask[:, BATTERY_NODE_IDX] = False # 조상 마스크에서 배터리 제외
-                        can_be_parent[inst_constr] &= ~anc_mask
+                        candidate_mask[inst_constr] &= ~anc_mask
                         
                         if f_flag == 1:
                             same_parent_mask = (self.arange_nodes == parent_of_j_idx.unsqueeze(1))
@@ -682,14 +710,36 @@ class PocatEnv(EnvBase):
                 # 🚀 (N_sim,) 배치에 대해 연쇄 효과 전체 시뮬레이션 실행
                 (final_i_out, power_loss, junction_temp) = self._calculate_tree_loads(sim_nodes, sim_adj_matrix)
 
+                # --- [신규] 시뮬레이션 결과 저장 ---
+                # (N_sim,)
+                sim_rows = torch.arange(N_sim, device=self.device)
+                sim_parent_i_out = final_i_out[sim_rows, sim_parent_indices_global]
+                sim_parent_tj = junction_temp[sim_rows, sim_parent_indices_global]
+                sim_i_out_results[b_idx_sim_chunk, sim_parent_indices_global] = sim_parent_i_out
+                sim_tj_results[b_idx_sim_chunk, sim_parent_indices_global] = sim_parent_tj
+
                 # 💡 [벡터화] (N_sim, N) IC 노드 마스크 생성
-                ic_mask_sim = (sim_nodes[..., FEATURE_INDEX["node_type"][0] + NODE_TYPE_IC] == 1.0)
+                nt_s, nt_e = FEATURE_INDEX["node_type"]
+                sim_types = sim_nodes[..., nt_s:nt_e].argmax(dim=-1)
+                ic_mask_sim = (sim_types == NODE_TYPE_IC)
+                # --- 마진 적용 (config: current_margin, thermal_margin_percent) ---
+                i_limit_raw = sim_nodes[..., FEATURE_INDEX["i_limit"]]
+                t_max_raw   = sim_nodes[..., FEATURE_INDEX["t_junction_max"]]
+                margin_I = float(self.generator.config.constraints.get("current_margin", 0.0))
+                margin_T = float(self.generator.config.constraints.get("thermal_margin_percent", 0.0))
+                i_limit = i_limit_raw * (1.0 - margin_I)
+                t_max   = t_max_raw   * (1.0 - margin_T)
 
-                i_limit = sim_nodes[..., FEATURE_INDEX["i_limit"]]
-                t_max = sim_nodes[..., FEATURE_INDEX["t_junction_max"]]
+                # --- 수치 안전 + 한계 비교 ---
+                current_check_ok = (
+                    torch.isfinite(final_i_out) & torch.isfinite(i_limit) &
+                    (final_i_out <= i_limit + 1e-6)
+                )
+                temp_check_ok = (
+                    torch.isfinite(junction_temp) & torch.isfinite(t_max) &
+                    (junction_temp <= t_max + 1e-6)
+                )
 
-                current_check_ok = (final_i_out <= i_limit + 1e-6)
-                temp_check_ok = (junction_temp <= t_max + 1e-6)
 
                 # (N_sim, N) -> (N_sim,)
                 all_currents_ok = (current_check_ok | ~ic_mask_sim).all(dim=-1)
@@ -717,9 +767,12 @@ class PocatEnv(EnvBase):
                      "Volt OK": volt_ok,
                      "Cycle OK": cycle_ok,
                      "Exclusive OK": exclusive_ok, # 수정된 최종 로직
-                     "Sim OK": current_and_thermal_ok, # 💡 시뮬레이션 결과 마스크
-                     "Sequence OK": candidate_mask # 시뮬레이션 직전 마스크
-                 })
+                     "Sequence OK": candidate_mask, # 시뮬레이션 직전 마스크
+                     "Sim OK": current_and_thermal_ok, # 💡 시뮬레이션 결과 마a스크
+                     # --- [신규] 시뮬레이션 값 반환 ---
+                     "Sim I_out": sim_i_out_results,
+                     "Sim Tj": sim_tj_results
+                })
 
         # --- 3. 최종 반환 ---
         if debug:

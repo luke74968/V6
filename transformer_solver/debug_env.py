@@ -9,6 +9,7 @@ import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from transformer_solver.solver_env import PocatEnv, BATTERY_NODE_IDX
+from transformer_solver.definitions import FEATURE_INDEX, NODE_TYPE_IC
 
 def run_interactive_debugger(config_file):
     """대화형으로 Power Tree를 만들며 마스킹 로직을 디버깅하는 스크립트"""
@@ -19,7 +20,11 @@ def run_interactive_debugger(config_file):
     td = env.reset(batch_size=1)
     
     node_names = env.generator.config.node_names
+    num_nodes = env.generator.num_nodes # 💡 [신규] num_nodes 추가
     node_name_to_idx = {name: i for i, name in enumerate(node_names)}
+    
+    # 💡 [신규] 노드 타입 피처 인덱스 미리 정의
+    nt_s, nt_e = FEATURE_INDEX["node_type"]
 
     print("="*50)
     print("🚀 POCAT Transformer Interactive Debugger 🚀")
@@ -39,8 +44,12 @@ def run_interactive_debugger(config_file):
         if current_head_idx == BATTERY_NODE_IDX:
             print("🌲 Head: 🔋 Battery (Action: Select a new load)")
         else:
+            # --- [신규] 현재 헤드의 소모 전류(mA)를 가져옵니다 ---
+            current_active = td["nodes"][0, current_head_idx, FEATURE_INDEX["current_active"]].item()
+            current_active_ma = current_active * 1000
             target_load_idx = td["current_target_load"].item()
             target_load_name = "None" if target_load_idx == -1 else node_names[target_load_idx]
+            print(f"🌲 Head: 🔌 {current_head_name} (Consumes: {current_active_ma:.1f}mA) (Targeting: {target_load_name})")
             print(f"🌲 Head: 🔌 {current_head_name} (Targeting: {target_load_name})")
             print("Action: Find a parent for the current head")
             
@@ -54,12 +63,24 @@ def run_interactive_debugger(config_file):
         # 3. 모든 노드에 대한 마스킹 결과와 이유 출력
         print("\n--- Masking Details ---")
         
-        # 💡 [수정] reasons 딕셔너리가 비어있지 않은지 확인 (중요)
-        if not reasons:
+        # --- [FIX] "Select New Load" 모드인지 "Find Parent" 모드인지 확인 ---
+        is_find_parent_mode = "Not Load" in reasons
+        
+        if not is_find_parent_mode:
              print(f"{'Node Name':<50} | {'VALID?':<8}")
              print("-" * 61)
         else:
-            header = f"{'Node Name':<50} | {'VALID?':<8} | " + " | ".join(f"{k:<12}" for k in reasons.keys())
+            # 1. 헤더 정의 ("Find Parent" 모드일 때만)
+            new_cols = ["I_now(mA)", "Tj_now(C)", "I_sim(mA)", "Tj_sim(C)"]
+            col_widths = [13, 10, 13, 10] # 💡 6자리 소수점을 위해 너비 증가
+            # 💡 [FIX] bool_reasons를 여기서 정의
+            bool_reasons = [k for k in reasons.keys() if k not in ["Sim I_out", "Sim Tj"]]
+            
+            header_parts = [f"{'Node Name':<50}", f"{'VALID?':<8}"]
+            header_parts.extend(f"{k:<12}" for k in bool_reasons)
+            header_parts.extend(f"{k:<{w}}" for k, w in zip(new_cols, col_widths))
+            
+            header = " | ".join(header_parts)
             print(header)
             print("-" * len(header))
 
@@ -68,18 +89,56 @@ def run_interactive_debugger(config_file):
             if is_valid:
                 valid_actions.append(name)
 
-            # 💡 [수정] reasons가 비어있을 때(예: [Select Load] 모드)와
-            #          reasons가 있을 때([Find Parent] 모드)를 분리하여 처리
-            if not reasons:
-                if is_valid: # [Select Load] 모드일 경우 유효한 것만 출력
+            # --- [FIX] 모드에 따라 분기 ---
+            if not is_find_parent_mode:
+                # "Select New Load" 모드
+                if is_valid: 
                     print(f"{name:<50} | {'✅ YES':<8}")
-                continue
+                continue # 👈 [중요] 다음 노드로 바로 넘어감
             else:
-                # --- 👇 [핵심 버그 수정] ---
-                # reasons[k][idx] -> reasons[k][0, idx]로 수정
-                reason_str = " | ".join(f"{('✅' if reasons[k][0, idx] else '❌'):<12}" for k in reasons.keys())
-                # --- 수정 완료 ---
-                print(f"{name:<50} | {('✅ YES' if is_valid else '❌ NO'):<8} | {reason_str}")
+                # "Find Parent" 모드
+                
+                # 1. 현재 값 가져오기
+                current_i_out = td["nodes"][0, idx, FEATURE_INDEX["current_out"]].item()
+                current_tj = td["nodes"][0, idx, FEATURE_INDEX["junction_temp"]].item()
+                
+                # 2. boolean 이유 문자열 생성 (bool_reasons가 여기서 보장됨)
+                reason_str_parts = []
+                for k in bool_reasons:
+                    tensor = reasons[k]
+                    # debug_env는 B=1 이므로 [0, idx]로 접근
+                    value = tensor[0, idx].item() 
+                    reason_str_parts.append(f"{('✅' if value else '❌'):<12}")
+                reason_str = " | ".join(reason_str_parts)
+                
+                # 3. 시뮬레이션 값 가져오기
+                sim_i_out = reasons.get("Sim I_out", torch.empty(1, num_nodes).fill_(-1.0))[0, idx].item()
+                sim_tj = reasons.get("Sim Tj", torch.empty(1, num_nodes).fill_(-1.0))[0, idx].item()
+                
+                # 4. 시뮬레이션 값 포맷팅 (시뮬레이션 안 한 노드는 '----' 표시)
+                sim_i_str = f"{sim_i_out*1000:10.6f}" if sim_i_out != -1.0 else "----"
+                sim_tj_str = f"{sim_tj:7.1f}" if sim_tj != -1.0 else "----"
+                
+                # 5. 현재 값 포맷팅 (IC 노드만 의미 있으므로 IC만 표시)
+                node_type = td["nodes"][0, idx, nt_s:nt_e].argmax().item()
+                is_ic = (node_type == NODE_TYPE_IC)
+                
+                curr_i_str = f"{current_i_out*1000:10.6f}" if is_ic else "----"
+                curr_tj_str = f"{current_tj:7.1f}" if is_ic else "----"
+
+                # 6. 최종 행 출력
+                row_parts = [
+                    f"{name:<50}",
+                    f"{('✅ YES' if is_valid else '❌ NO'):<8}",
+                    f"{reason_str}",
+                    f"{curr_i_str:<13}",
+                    f"{curr_tj_str:<10}",
+                    f"{sim_i_str:<13}",
+                    f"{sim_tj_str:<10}"
+                ]
+                print(" | ".join(row_parts))
+                
+        # ... (이하 valid_actions 출력 및 사용자 입력 로직은 동일) ...
 
         print("\n--- Valid Actions ---")
         if not valid_actions:
@@ -109,7 +168,6 @@ def run_interactive_debugger(config_file):
         td = output["next"]
 
     print("\n🎉 Power Tree construction finished!")
-    # 💡 [수정] reward가 스칼라가 아닐 수 있으므로 .item() 추가
     final_reward = output['reward'].item() if output['reward'].numel() == 1 else output['reward'][0].item()
     print(f"Final Cost: ${-final_reward:.4f}")
 
