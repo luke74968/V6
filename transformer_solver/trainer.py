@@ -1,6 +1,8 @@
 # transformer_solver/trainer.py
 import torch
 from tqdm import tqdm
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
 import torch.nn.functional as F # 👈 F.mse_loss를 위해 추가
 import os
 import time # 💡 시간 측정을 위해 time 모듈 추가
@@ -46,6 +48,10 @@ class PocatTrainer:
     def __init__(self, args, env: PocatEnv, device: str):
         self.args = args
         self.env = env
+        # --- 👇 [DDP] DDP 관련 플래그 저장 ---
+        self.is_ddp = args.ddp
+        self.local_rank = args.local_rank
+        # --- 👆 [DDP] 수정 완료 ---
         self.device = device # 전달받은 device 저장
 
         self.result_dir = args.result_dir
@@ -56,6 +62,11 @@ class PocatTrainer:
         
         # 💡 3. 모델을 생성 후, 지정된 device로 이동
         self.model = PocatModel(**args.model_params).to(self.device)
+        # --- 👇 [DDP] 모델을 DDP로 감싸기 ---
+        if self.is_ddp:
+            # find_unused_parameters=True는 복잡한 모델에서 일부 파라미터가 사용되지 않을 때 동기화 오류를 방지합니다.
+            self.model = DDP(self.model, device_ids=[self.local_rank], find_unused_parameters=True)
+        # --- 👆 [DDP] 수정 완료 ---
         cal_model_size(self.model, args.log)
         
         # 💡 float()으로 감싸서 값을 숫자로 강제 변환합니다.
@@ -217,6 +228,9 @@ class PocatTrainer:
                 
                 # --- 👇 [핵심 수정 1] 학습 시 데이터 확장 ---
                 if args.num_pomo_samples > 1:
+                    # 💡 [DDP] DDP 사용 시, 이미 배치가 world_size만큼 나뉘었으므로
+                   # 각 프로세스가 POMO 샘플링을 수행하면 총 배치는
+                    # (B * N_pomo * World_Size)가 됩니다 
                     td = batchify(td, args.num_pomo_samples)
                 # --- 수정 완료 ---
 
@@ -259,14 +273,16 @@ class PocatTrainer:
 
                 bwd_time = time.time() - bwd_start_time
 
-                logging.debug(
-                    "Epoch %d step %d reset=%.3fms model=%.3fms backward=%.3fms",
-                    epoch,
-                    step,
-                    reset_time * 1000,
-                    model_time * 1000,
-                    bwd_time * 1000,
-                )
+                # --- 👇 [DDP] 0번 프로세스에서만 디버그 로그 출력 ---
+                if self.local_rank <= 0:
+                    logging.debug(
+                        "Epoch %d step %d reset=%.3fms model=%.3fms backward=%.3fms",
+                        epoch,
+                        step,
+                        reset_time * 1000,
+                        model_time * 1000,
+                        bwd_time * 1000,
+                    )
 
                 # 각 샘플 실행에서 찾은 최상의 보상을 가져옴
                 best_reward_per_sample_run = reward.max(dim=1)[0]
@@ -278,10 +294,8 @@ class PocatTrainer:
                 
                 # 💡 **[변경 2]** 현재 배치의 평균 비용과 최소 비용 계산
                 avg_cost = -avg_of_bests.mean().item()
-                # --- 👇 [핵심 수정] ---
                 # 'reward' 텐서(모든 샘플/시작노드의 보상)에서 가장 높은 보상(=가장 낮은 비용)을 찾습니다.
                 min_batch_cost = -reward.max().item()
-                # --- 수정 완료 --
                 min_epoch_cost = min(min_epoch_cost, min_batch_cost)
 
 
@@ -289,40 +303,53 @@ class PocatTrainer:
                 total_cost += avg_cost
                 total_policy_loss += policy_loss.item()
                 total_critic_loss += critic_loss.item()
-                update_progress(
-                    train_pbar,
-                    {
-                        "Loss": loss.item(),
-                        "Avg Cost": total_cost / step,
-                        "Min Cost": min_epoch_cost,
-                        "T_Reset": reset_time * 1000,
-                    },
-                )
+
+                # --- 👇 [DDP] 0번 프로세스에서만 pbar 업데이트 ---
+                if self.local_rank <= 0:
+                    update_progress(
+                        train_pbar,
+                        {
+                            "Loss": loss.item(),
+                            "Avg Cost": total_cost / step,
+                            "Min Cost": min_epoch_cost,
+                            "T_Reset": reset_time * 1000,
+                        },
+                    )
 
             train_pbar.close()
 
-            epoch_summary = (
-                f"Epoch {epoch}/{args.trainer_params['epochs']} | "
-                f"Total Loss {total_loss / total_steps:.4f} | "
-                f"P_Loss {total_policy_loss / total_steps:.4f} | "
-                f"V_Loss {total_critic_loss / total_steps:.4f} | "
-                f"Min Cost ${min_epoch_cost:.2f}"
-            )
-            tqdm.write(epoch_summary)
-            args.log(epoch_summary) # 에폭 종료 메시지도 로그에 기록
-            val = self.evaluate(epoch)
-            self.args.log(f"[Eval] Epoch {epoch} | Avg BOM ${val['avg_bom']:.2f} | Min BOM ${val['min_bom']:.2f}")
+            # --- 👇 [DDP] 0번 프로세스에서만 에폭 요약 및 평가 실행 ---
+            if self.local_rank <= 0:
+                epoch_summary = (
+                    f"Epoch {epoch}/{args.trainer_params['epochs']} | "
+                    f"Total Loss {total_loss / total_steps:.4f} | "
+                    f"P_Loss {total_policy_loss / total_steps:.4f} | "
+                    f"V_Loss {total_critic_loss / total_steps:.4f} | "
+                    f"Min Cost ${min_epoch_cost:.2f}"
+                )
+                tqdm.write(epoch_summary)
+                args.log(epoch_summary) # 에폭 종료 메시지도 로그에 기록
+                
+                val = self.evaluate(epoch)
+                self.args.log(f"[Eval] Epoch {epoch} | Avg BOM ${val['avg_bom']:.2f} | Min BOM ${val['min_bom']:.2f}")
 
             self.scheduler.step()
-            self.time_estimator.print_est_time(epoch, args.trainer_params['epochs'])
+
+            if self.local_rank <= 0:
+                self.time_estimator.print_est_time(epoch, args.trainer_params['epochs'])            
+            # --- 👇 [DDP] 0번 프로세스에서만 모델 저장 ---
             
-            if (epoch % args.trainer_params['model_save_interval'] == 0) or (epoch == args.trainer_params['epochs']):
+            if self.local_rank <= 0 and ((epoch % args.trainer_params['model_save_interval'] == 0) or (epoch == args.trainer_params['epochs'])):                
                 save_path = os.path.join(args.result_dir, f'epoch-{epoch}.pth')
                 args.log(f"Saving model at epoch {epoch} to {save_path}")
                 self._run_test_visualization(epoch, is_best=False)
+                
+                # 💡 DDP로 감싸진 모델은 .module을 통해 원본 모델의 state_dict에 접근합니다.
+                model_state_dict = self.model.module.state_dict() if self.is_ddp else self.model.state_dict()
+
                 torch.save({
                     'epoch': epoch,
-                    'model_state_dict': self.model.state_dict(),
+                    'model_state_dict': model_state_dict,
                     'optimizer_state_dict': self.optimizer.state_dict(),
                 }, save_path)
 
@@ -371,12 +398,16 @@ class PocatTrainer:
         if avg_bom < self.best_eval_bom:
             self.best_eval_bom = avg_bom
             save_path = os.path.join(self.result_dir, "best_cost.pth")
+
+            # 💡 DDP로 감싸진 모델은 .module을 통해 원본 모델의 state_dict에 접근합니다.
+            model_state_dict = self.model.module.state_dict() if self.is_ddp else self.model.state_dict()
+
             torch.save({
                 'epoch': epoch,
-                'model_state_dict': self.model.state_dict(),
+                'model_state_dict': model_state_dict,
                 'optimizer_state_dict': self.optimizer.state_dict(),
             }, save_path)
-            # --- 👇 [요청 2] Best 모델 저장 시 테스트 시각화 실행 ---
+
             self.args.log(f"[Eval] ✅ Running test visualization for new best model...")
             self._run_test_visualization(epoch, is_best=True)
             self.args.log(f"[Eval] ✅ New best avg_bom=${avg_bom:.2f} (min=${min_bom:.2f}) at epoch {epoch} → saved {save_path}")

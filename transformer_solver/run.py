@@ -1,5 +1,6 @@
 # transformer_solver/run.py
 import os
+import torch.distributed as dist
 import sys
 import time
 import yaml
@@ -18,18 +19,32 @@ if torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 8:
 from .trainer import PocatTrainer
 from .solver_env import PocatEnv
 
-def setup_logger(result_dir):
+def setup_logger(result_dir, rank=0):
     log_file = os.path.join(result_dir, 'log.txt')
     logging.basicConfig(filename=log_file, format='%(asctime)-15s %(message)s', level=logging.INFO)
     logger = logging.getLogger()
-    console = logging.StreamHandler(sys.stdout)
-    logger.addHandler(console)
+    # 💡 [DDP] 0번 프로세스(메인)에서만 콘솔에 로그를 출력합니다.
+    if rank <= 0:
+        console = logging.StreamHandler(sys.stdout)
+        logger.addHandler(console)
     return logger
 
 def main(args):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    args.log(f"Using device: {device}")
-    
+    # --- 👇 [DDP] DDP 초기화 로직 ---
+    args.local_rank = int(os.environ.get('LOCAL_RANK', -1))
+    args.world_size = int(os.environ.get('WORLD_SIZE', 1))
+    args.ddp = args.world_size > 1
+
+    if args.ddp:
+        dist.init_process_group(backend='nccl')
+        torch.cuda.set_device(args.local_rank)
+        device = torch.device(f"cuda:{args.local_rank}")
+        if args.local_rank <= 0:
+            args.log(f"🚀 DDP 모드로 {args.world_size}개의 GPU를 사용하여 실행합니다.")
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        args.log(f"Using single device: {device}")
+    # --- 👆 [DDP] 수정 완료 ---
     # --- 👇 1. PocatEnv 생성 시 instance_repeats 인자 제거 ---
     env = PocatEnv(
         generator_params={"config_file_path": args.config_file},
@@ -47,10 +62,15 @@ def main(args):
         trainer.pretrain_critic(expert_data_path=args.pretrain_critic, 
                                 pretrain_epochs=args.pretrain_epochs)
 
+    # --- 👇 [DDP] 0번 프로세스에서만 테스트/훈련 실행 ---
     if args.test_only:
-        trainer.test()
+        if args.local_rank <= 0:
+            trainer.test()
     else:
         trainer.run()
+    
+    if args.ddp:
+        dist.destroy_process_group()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -94,7 +114,10 @@ if __name__ == "__main__":
     args.result_dir = os.path.join('transformer_solver', 'result', args.start_time)
     os.makedirs(args.result_dir, exist_ok=True)
     
-    logger = setup_logger(args.result_dir)
+    # --- 👇 [DDP] 로거 설정 시 local_rank 전달 ---
+    # (DDP 초기화 전이므로, os.environ에서 직접 읽어옴)
+    local_rank_init = int(os.environ.get('LOCAL_RANK', 0))
+    logger = setup_logger(args.result_dir, rank=local_rank_init)
     args.log = logger.info
     
     with open(args.config_yaml, "r", encoding="utf-8") as f:
@@ -103,16 +126,19 @@ if __name__ == "__main__":
         if not hasattr(args, key):
             setattr(args, key, value)
 
-    args.ddp = False
+    # --- 👇 [DDP] 각 프로세스별로 다른 시드를 갖도록 설정 ---
+    seed = args.seed
     
     if torch.cuda.is_available():
-        torch.cuda.manual_seed(args.seed)
-    random.seed(args.seed)
-    torch.manual_seed(args.seed)
+        if int(os.environ.get('WORLD_SIZE', 1)) > 1:
+            seed += local_rank_init # DDP 모드일 때만 랭크별 시드 오프셋 추가
+    torch.cuda.manual_seed(seed)
+    random.seed(seed)
+    torch.manual_seed(seed)
 
     # 💡 수정된 부분: 로깅 전 non-JSON-serializable 객체 제거
     args_dict_for_log = vars(args).copy()
     del args_dict_for_log['log']
-    args.log(json.dumps(args_dict_for_log, indent=4))
-    
+    if local_rank_init <= 0: # 0번 프로세스에서만 인자 로그 출력
+        args.log(json.dumps(args_dict_for_log, indent=4))    
     main(args)
