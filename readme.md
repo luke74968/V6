@@ -46,6 +46,14 @@ python3 -m transformer_solver.run --test_only --config_file configs/config_4.jso
 # 예시 2 (best_cost.pth 사용)
 python3 -m transformer_solver.run --test_only --config_file configs/config_6.json --config_yaml configs/config.yaml --log_mode detail --log_idx 0 --load_path "transformer_solver/result/2025-1013-133337/best_cost.pth"
 
+# OR-tools 정답지 생성 
+python3 generate_expert_data.py --config_file configs/config_6.json --output_file expert_data/dataset.json
+
+# Pre-train 후 훈련 시작
+python3 -m transformer_solver.run --config_file configs/config_6.json --config_yaml configs/config.yaml \
+--pretrain_critic expert_data/dataset.json \
+--pretrain_epochs 5 \
+--batch_size 2 --num_pomo_samples 48
 
 # 디버그 모드 
 # 대화형으로 마스킹 로직을 테스트합니다.
@@ -55,3 +63,38 @@ python3 -m transformer_solver.debug_env configs/config_6.json
 # git add . or git add 파일명
 # git commit -m "description"
 # git push origin master
+
+
+# git remote -v
+# git branch
+# git branch -M feature/action-critic
+# git git push origin feature/action-critic
+
+
+
+# 서버관련 셋업
+# 가상환경 생성 (v6_env 라는 이름으로, Python 3.10 버전을 사용)
+conda create -n v6_env python=3.12 -y
+
+# 가상환경 활성화 (Linux/Window 동일)
+conda activate v6_env
+
+# (가상환경이 (v6_env) 로 바뀐 것을 확인)
+
+# PyTorch 설치 (CUDA 12.9 기준) - (이 부분은 동일합니다)
+pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu129
+
+# 기타 라이브러리 설치 - (이 부분도 동일합니다)
+pip install -r requirements.lock.txt
+
+conda activate v6_env
+
+export CUDA_VISIBLE_DEVICES=2,3
+
+torchrun --standalone --nproc_per_node=2 -m transformer_solver.run \
+    --config_file configs/config_6.json \
+    --config_yaml configs/config.yaml \
+    --batch_size 256 \
+    --log_idx 8 \
+    --log_mode progress \
+    --decode_type sampling

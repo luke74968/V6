@@ -207,7 +207,11 @@ def visualize_tree(solution, candidate_ics, loads, battery, constraints, junctio
     return dot
 
 
-def print_and_visualize_one_solution(solution, candidate_ics, loads, battery, constraints, solution_index=0):
+def print_and_visualize_one_solution(
+    solution, candidate_ics, loads, battery, constraints, 
+    solution_index=0,
+    custom_output_dir: str = None # 👈 [신규] 이미지 저장 경로 인자
+):
     """
     하나의 솔루션을 콘솔에 출력하고, 다이어그램으로 시각화하여 저장합니다.
     """
@@ -360,8 +364,12 @@ def print_and_visualize_one_solution(solution, candidate_ics, loads, battery, co
 # --- 👇 [수정] 결과 저장 경로 변경 ---
     
     # 1. 오늘 날짜로 폴더 경로 생성 (예: or_tools_solver/result/2025-11-03)
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    output_dir = os.path.join("or_tools_solver", "result", today_str)
+    if custom_output_dir:
+        output_dir = custom_output_dir
+    else:
+        # [기본값] custom_output_dir가 없으면 기존 경로 사용
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        output_dir = os.path.join("or_tools_solver", "result", today_str)
     
     # 2. 폴더가 없으면 생성
     os.makedirs(output_dir, exist_ok=True)
