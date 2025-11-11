@@ -222,7 +222,10 @@ class PocatEnv(EnvBase):
         
         current_demands[ic_mask_b_n] = 0.0
         
-        adj_matrix_T = adj_matrix.float().transpose(-1, -2)
+        # Adjacency는 (parent -> child) 방향으로 정의되어 있으므로, 부모 노드의 출력 전류를
+        # 얻기 위해서는 자식 노드들의 수요(current_demands)를 같은 방향으로 곱해야 한다.
+        # 따라서 transpose 없이 float 캐스트한 행렬을 그대로 사용한다.
+        adj_matrix_float = adj_matrix.float()
         
         # --- [수정 1] i_out을 루프 밖에서 선언 ---
         i_out = torch.zeros_like(current_demands)
@@ -230,7 +233,7 @@ class PocatEnv(EnvBase):
         # 2. Propagate currents up the tree
         for _ in range(num_nodes):
             # --- [수정 2] i_out을 여기서 계산 (이것이 실제 출력 전류) ---
-            i_out = (adj_matrix_T @ current_demands.unsqueeze(-1)).squeeze(-1)
+            i_out = (adj_matrix_float @ current_demands.unsqueeze(-1)).squeeze(-1)
             
             op_current = nodes_tensor[..., FEATURE_INDEX["op_current"]]
             i_in_ldo = i_out + op_current
@@ -260,7 +263,7 @@ class PocatEnv(EnvBase):
             
         # 3. Final calculations
         # --- [수정 3] 'final_i_out'을 다시 계산하는 버그 라인 삭제 ---
-        # final_i_out = (adj_matrix_T @ current_demands.unsqueeze(-1)).squeeze(-1) # <-- ❌ 이 줄을 삭제
+        # final_i_out = (adj_matrix_float @ current_demands.unsqueeze(-1)).squeeze(-1) # <-- ❌ 이 줄을 삭제
         
         # --- [수정 4] 'i_out' (안정화된 최종 출력 전류)을 사용 ---
         power_loss = self._calculate_power_loss(nodes_tensor, i_out)
